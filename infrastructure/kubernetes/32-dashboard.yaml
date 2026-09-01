@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neuroforge-dashboard
+  namespace: neuroforge
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: neuroforge-dashboard }
+  template:
+    metadata:
+      labels: { app: neuroforge-dashboard }
+    spec:
+      containers:
+        - name: dashboard
+          image: neuroforge-dashboard:latest
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef: { name: neuroforge-config }
+          readinessProbe:
+            httpGet: { path: /, port: 3000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neuroforge-dashboard
+  namespace: neuroforge
+spec:
+  selector: { app: neuroforge-dashboard }
+  ports:
+    - port: 3000
+      targetPort: 3000

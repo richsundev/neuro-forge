@@ -1,0 +1,23 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: pip install uv
+      - name: Install project (mock mode — no paid APIs needed)
+        run: |
+          uv pip install --system -e ".[dev]"
+          uv pip install --system -e ./apps/api
+      - name: Run tests
+        run: pytest -q --cov=neuroforge --cov-report=term-missing

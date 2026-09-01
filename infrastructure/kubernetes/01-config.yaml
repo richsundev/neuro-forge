@@ -1,0 +1,11 @@
+# Non-secret configuration. Secrets (DB password, bootstrap API key) live in 02-secrets.yaml —
+# never commit real values there; it's checked in as a template with placeholders (see README).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: neuroforge-config
+  namespace: neuroforge
+data:
+  NEUROFORGE_REDIS_URL: "redis://neuroforge-redis:6379/0"
+  NEUROFORGE_STATE_DIR: "/data/neuroforge_state"
+  NEXT_PUBLIC_API_URL: "http://neuroforge-api:8000"

@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: neuroforge
+      POSTGRES_PASSWORD: neuroforge
+      POSTGRES_DB: neuroforge
+    ports:
+      - "5432:5432"
+    volumes:
+      - neuroforge_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neuroforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/api.Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      NEUROFORGE_DATABASE_URL: postgresql+psycopg2://neuroforge:neuroforge@postgres:5432/neuroforge
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/api.Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      NEUROFORGE_DATABASE_URL: postgresql+psycopg2://neuroforge:neuroforge@postgres:5432/neuroforge
+      NEUROFORGE_REDIS_URL: redis://redis:6379/0
+      NEUROFORGE_STATE_DIR: /data/neuroforge_state
+    volumes:
+      - neuroforge_state:/data/neuroforge_state
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/worker.Dockerfile
+    environment:
+      NEUROFORGE_DATABASE_URL: postgresql+psycopg2://neuroforge:neuroforge@postgres:5432/neuroforge
+      NEUROFORGE_REDIS_URL: redis://redis:6379/0
+      NEUROFORGE_STATE_DIR: /data/neuroforge_state
+    volumes:
+      - neuroforge_state:/data/neuroforge_state
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/dashboard.Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  neuroforge_postgres:
+  neuroforge_state:

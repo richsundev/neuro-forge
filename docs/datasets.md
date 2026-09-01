@@ -1,0 +1,47 @@
+# Datasets & Challenge Evolution
+
+## Versioning
+
+`datasets/dataset.py:DatasetVersion` is an immutable, content-hashed snapshot of `Challenge`s,
+carrying `parent_version`, `source` (`seed` | `failure_driven` | `benchmark_evolution`), and a
+`difficulty_score`. `seed_dataset()` builds the first version; `evolve_if_saturated()` builds the
+next one when candidates start saturating the current one.
+
+## Holdout protection — the anti-overfitting mechanism
+
+`datasets/holdout.py:HoldoutGuard` is the actual enforcement point, not just a documented
+convention:
+
+- `search_set()` — train split only. This is the only split `ExperimentEngine`'s search loop ever
+  touches.
+- `validation_set()` — used once per experiment, after search finishes, to pick the final
+  candidate and run the statistical comparison.
+- `evaluate_holdout(genome_hash)` — the *only* way to reach the holdout split, and it raises
+  `HoldoutViolation` if called twice for the same genome hash. Re-running a holdout evaluation to
+  chase a better number would defeat the entire point of having one.
+
+`deterministic_split()` assigns each challenge to train/validation/holdout via a stable hash of
+`(seed, challenge_id)` — the same challenge always lands in the same split even as the dataset
+grows, so adding challenges later doesn't reshuffle earlier promotion decisions' evidence.
+
+## Benchmark evolution
+
+`datasets/evolution.py:evolve_if_saturated()` checks whether the mean search-split score has
+crossed `SATURATION_THRESHOLD` (0.90); if so, it generates a new, harder `DatasetVersion` (higher
+difficulty band, more challenges) with `parent_version` set — the Challenge Evolution dashboard
+page plots `difficulty_score` across versions. This exists so a search can't "win" by exhausting a
+static, eventually-too-easy benchmark; see section 63/14 of the original brief for the narrative
+this implements.
+
+## Failure-driven challenge generation
+
+`failure_driven_challenges()` generates new challenges concentrated on categories a candidate is
+currently failing, rather than uniformly across all categories — turning an observed failure mode
+into targeted evaluation material (mirrors the "agent incorrectly issued refund → generate more
+refund-edge-case challenges" example from the brief).
+
+## Adversarial categories (ForgeSupport)
+
+`policy_faq`, `refund_request`, `duplicate_charge`, `conflicting_order_ids`, `ambiguous_request`,
+`escalation_case`, `long_context_policy`, `malformed_tool_response` — each with its own template
+family and its own weighting of which genome sub-scores matter (see docs/evaluation.md).

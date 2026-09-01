@@ -1,0 +1,394 @@
+"""NeuroForge CLI (section 45). A thin wrapper over the same engine/domain/db code the API uses —
+no logic lives here that isn't also reachable programmatically.
+"""
+
+from __future__ import annotations
+
+import json
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from neuroforge.cli.paths import state_dir
+from neuroforge.datasets.dataset import DatasetVersion
+from neuroforge.datasets.evolution import evolve_if_saturated, seed_dataset
+from neuroforge.db.models import ExperimentRecord
+from neuroforge.db.repository import (
+    get_experiment,
+    get_genome,
+    latest_dataset_version,
+    list_experiments,
+    list_genomes_for_system,
+    save_canary_result,
+    save_dataset_version,
+    save_experiment,
+    save_genome,
+    save_promotion_decision,
+    upsert_application,
+)
+from neuroforge.db.session import init_db, session_scope
+from neuroforge.domains import get_domain
+from neuroforge.evaluation.aggregate import aggregate
+from neuroforge.evaluation.statistics import compare
+from neuroforge.experiments.checkpoint import ExperimentCheckpoint
+from neuroforge.experiments.engine import ExperimentConfig, ExperimentEngine
+from neuroforge.experiments.spaces import search_space_for_domain
+from neuroforge.genomes.schema import SystemGenome
+from neuroforge.promotion.canary import simulate_canary
+from neuroforge.promotion.gates import PromotionGateConfig, evaluate_promotion
+from neuroforge.promotion.safety import SafetyConstraints
+from neuroforge.providers.registry import get_provider
+
+app = typer.Typer(help="NeuroForge: autonomous LLM system evolution & experimentation engine.")
+app_cmd = typer.Typer(help="Manage applications.")
+genome_cmd = typer.Typer(help="Inspect system genomes.")
+experiment_cmd = typer.Typer(help="Create, run, and inspect experiments.")
+dataset_cmd = typer.Typer(help="Manage datasets and challenge sets.")
+candidate_cmd = typer.Typer(help="Compare candidate genomes.")
+promotion_cmd = typer.Typer(help="Request and inspect promotion decisions.")
+canary_cmd = typer.Typer(help="Run canary simulations.")
+
+app.add_typer(app_cmd, name="app")
+app.add_typer(genome_cmd, name="genome")
+app.add_typer(experiment_cmd, name="experiment")
+app.add_typer(dataset_cmd, name="dataset")
+app.add_typer(candidate_cmd, name="candidate")
+app.add_typer(promotion_cmd, name="promotion")
+app.add_typer(canary_cmd, name="canary")
+
+console = Console()
+
+
+@app.callback()
+def _init() -> None:
+    init_db()
+
+
+def _resolve_genome(session, ident: str) -> SystemGenome:
+    if "@v" in ident:
+        system_id, version_str = ident.split("@v", 1)
+        records = list_genomes_for_system(session, system_id)
+        for r in records:
+            if r.version == int(version_str):
+                return SystemGenome.model_validate(r.data)
+        raise typer.BadParameter(f"no genome found for {ident}")
+    genome = get_genome(session, ident)
+    if genome is None:
+        raise typer.BadParameter(f"no genome found with hash {ident}")
+    return genome
+
+
+# --- app ---------------------------------------------------------------
+
+
+@app_cmd.command("create")
+def app_create(app_id: str, name: str, domain: str = "forge-support", description: str = "") -> None:
+    with session_scope() as session:
+        upsert_application(session, app_id, name, domain, description)
+    console.print(f"[green]created application[/] {app_id} (domain={domain})")
+
+
+@app_cmd.command("list")
+def app_list() -> None:
+    from sqlalchemy import select
+
+    from neuroforge.db.models import ApplicationRecord
+
+    with session_scope() as session:
+        rows = list(session.scalars(select(ApplicationRecord)))
+    table = Table("id", "name", "domain", "created_at")
+    for r in rows:
+        table.add_row(r.id, r.name, r.domain_name, str(r.created_at))
+    console.print(table)
+
+
+# --- genome --------------------------------------------------------------
+
+
+@genome_cmd.command("show")
+def genome_show(ident: str) -> None:
+    with session_scope() as session:
+        genome = _resolve_genome(session, ident)
+    console.print_json(json.dumps(genome.model_dump(mode="json")))
+
+
+# --- dataset -------------------------------------------------------------
+
+
+@dataset_cmd.command("seed")
+def dataset_seed(dataset_id: str, domain: str = "forge-support", n: int = 100, seed: int = 1) -> None:
+    d = get_domain(domain)
+    dataset = seed_dataset(d, dataset_id, n=n, seed=seed)
+    with session_scope() as session:
+        save_dataset_version(session, dataset)
+    console.print_json(json.dumps(dataset.summary()))
+
+
+@dataset_cmd.command("list")
+def dataset_list() -> None:
+    from sqlalchemy import select
+
+    from neuroforge.db.models import DatasetVersionRecord
+
+    with session_scope() as session:
+        rows = list(session.scalars(select(DatasetVersionRecord).order_by(DatasetVersionRecord.dataset_id)))
+    table = Table("dataset_id", "version", "source", "n_challenges", "difficulty")
+    for r in rows:
+        table.add_row(r.dataset_id, str(r.version), r.source, str(r.n_challenges), f"{r.difficulty_score:.3f}")
+    console.print(table)
+
+
+@dataset_cmd.command("evolve")
+def dataset_evolve(
+    dataset_id: str,
+    mean_score: float = typer.Option(..., help="mean search-split score observed for the current best candidates"),
+    domain: str = "forge-support",
+    n_new: int = 30,
+    seed: int = 2,
+) -> None:
+    d = get_domain(domain)
+    with session_scope() as session:
+        current = latest_dataset_version(session, dataset_id)
+        if current is None:
+            raise typer.BadParameter(f"no dataset version found for '{dataset_id}' — run `dataset seed` first")
+        evolved = evolve_if_saturated(d, current, mean_score, n_new_challenges=n_new, seed=seed)
+        if evolved is None:
+            console.print(f"[yellow]not saturated[/] (mean_score={mean_score:.3f}) — benchmark unchanged")
+            raise typer.Exit(0)
+        save_dataset_version(session, evolved)
+    console.print(f"[green]benchmark evolved[/] -> version {evolved.version}, difficulty {evolved.difficulty_score:.3f}")
+    console.print_json(json.dumps(evolved.summary()))
+
+
+# --- experiment ------------------------------------------------------------
+
+
+@experiment_cmd.command("create")
+def experiment_create(
+    experiment_id: str,
+    system_id: str = "support-agent",
+    domain: str = "forge-support",
+    dataset_id: str | None = None,
+    strategy: str = "evolutionary",
+    seed: int = 42,
+    batch_size: int = 16,
+    max_batches: int = 20,
+    max_candidates: int = 200,
+) -> None:
+    dataset_id = dataset_id or f"{system_id}-dataset"
+    d = get_domain(domain)
+    with session_scope() as session:
+        upsert_application(session, system_id, system_id, domain)
+        baseline = get_genome_by_system_version(session, system_id, 1)
+        if baseline is None:
+            baseline = SystemGenome(system_id=system_id, version=1)
+            save_genome(session, baseline)
+        dataset = latest_dataset_version(session, dataset_id)
+        if dataset is None:
+            dataset = seed_dataset(d, dataset_id, n=100, seed=seed)
+            save_dataset_version(session, dataset)
+
+        from neuroforge.experiments.budget import ExperimentBudget
+
+        config = ExperimentConfig(
+            experiment_id=experiment_id,
+            domain_name=domain,
+            search_strategy=strategy,
+            search_space=search_space_for_domain(domain),
+            batch_size=batch_size,
+            max_batches=max_batches,
+            seed=seed,
+            budget=ExperimentBudget(max_candidates=max_candidates, max_requests=1_000_000, max_cost_usd=100, max_duration_minutes=60),
+        )
+        save_experiment(session, system_id, config, status="created")
+    console.print(f"[green]created experiment[/] {experiment_id} (system={system_id}, dataset={dataset_id})")
+
+
+def get_genome_by_system_version(session, system_id: str, version: int) -> SystemGenome | None:
+    for r in list_genomes_for_system(session, system_id):
+        if r.version == version:
+            return SystemGenome.model_validate(r.data)
+    return None
+
+
+@experiment_cmd.command("run")
+def experiment_run(experiment_id: str) -> None:
+    with session_scope() as session:
+        record: ExperimentRecord | None = get_experiment(session, experiment_id)
+        if record is None:
+            raise typer.BadParameter(f"unknown experiment '{experiment_id}' — run `experiment create` first")
+        config = ExperimentConfig.model_validate(record.config)
+        baseline = get_genome_by_system_version(session, record.application_id, 1)
+        assert baseline is not None
+        dataset_id = f"{record.application_id}-dataset"
+        dataset = latest_dataset_version(session, dataset_id)
+        assert dataset is not None, "dataset missing — this should not happen if experiment was created via the CLI"
+
+    engine = ExperimentEngine(config, baseline, dataset, state_dir() / experiment_id)
+    result = engine.run()
+
+    with session_scope() as session:
+        save_genome(session, SystemGenome.model_validate(result.best_genome))
+        save_experiment(session, record.application_id, config, result=result, status=result.status)
+
+    console.print(f"[bold]{experiment_id}[/] finished: {result.status} ({result.stop_reason})")
+    console.print(f"generations={result.generations_completed} candidates={result.candidates_evaluated}")
+    console.print(f"comparison: {result.comparison['summary']}")
+    console.print(f"[bold]{result.recommendation}[/]")
+
+
+@experiment_cmd.command("status")
+def experiment_status(experiment_id: str) -> None:
+    ckpt_path = state_dir() / experiment_id / f"{experiment_id}.checkpoint.json"
+    ckpt = ExperimentCheckpoint.load_or_none(ckpt_path)
+    if ckpt is None:
+        console.print(f"[yellow]no checkpoint yet for {experiment_id}[/] (has it been run?)")
+        raise typer.Exit(1)
+    console.print(
+        f"status={ckpt.status} stop_reason={ckpt.stop_reason!r} "
+        f"generations={ckpt.generations_completed()} candidates={ckpt.candidates_completed()} "
+        f"best_fitness={ckpt.best_fitness:.4f}"
+    )
+    console.print_json(json.dumps(ckpt.budget_state))
+
+
+@experiment_cmd.command("resume")
+def experiment_resume(experiment_id: str, extra_candidates: int = 100) -> None:
+    with session_scope() as session:
+        record = get_experiment(session, experiment_id)
+        if record is None:
+            raise typer.BadParameter(f"unknown experiment '{experiment_id}'")
+        config = ExperimentConfig.model_validate(record.config)
+
+    ckpt_path = state_dir() / experiment_id / f"{experiment_id}.checkpoint.json"
+    ckpt = ExperimentCheckpoint.load_or_none(ckpt_path)
+    already = ckpt.candidates_completed() if ckpt else 0
+    config.budget.max_candidates = already + extra_candidates
+    with session_scope() as session:
+        save_experiment(session, record.application_id, config, status="running")
+    experiment_run(experiment_id)
+
+
+@experiment_cmd.command("cancel")
+def experiment_cancel(experiment_id: str) -> None:
+    flag = state_dir() / experiment_id / f"{experiment_id}.cancel"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
+    console.print(f"[yellow]cancel requested[/] for {experiment_id} — it will stop at its next checkpoint")
+
+
+@experiment_cmd.command("list")
+def experiment_list() -> None:
+    with session_scope() as session:
+        rows = list_experiments(session)
+    table = Table("experiment_id", "domain", "strategy", "status", "created_at")
+    for r in rows:
+        table.add_row(r.experiment_id, r.domain_name, r.search_strategy, r.status, str(r.created_at))
+    console.print(table)
+
+
+# --- candidate -------------------------------------------------------------
+
+
+@candidate_cmd.command("compare")
+def candidate_compare(genome_a: str, genome_b: str, dataset_id: str, n_challenges: int = 60, seed: int = 1) -> None:
+    with session_scope() as session:
+        a = _resolve_genome(session, genome_a)
+        b = _resolve_genome(session, genome_b)
+        dataset = latest_dataset_version(session, dataset_id)
+        if dataset is None:
+            raise typer.BadParameter(f"unknown dataset '{dataset_id}'")
+
+    domain = get_domain_for_dataset(dataset)
+    provider = get_provider("mock")
+    challenges = dataset.split("validation") or dataset.split("train")
+    challenges = challenges[:n_challenges]
+
+    a_results = [domain.evaluate(a, c, provider) for c in challenges]
+    b_results = [domain.evaluate(b, c, provider) for c in challenges]
+    a_agg = aggregate(a_results, [c.category for c in challenges])
+    b_agg = aggregate(b_results, [c.category for c in challenges])
+    comparison = compare(
+        [r.metrics["quality"] for r in a_results], [r.metrics["quality"] for r in b_results], seed=seed
+    )
+
+    console.print(f"[bold]{genome_a}[/] -> {json.dumps(a_agg.as_dict())}")
+    console.print(f"[bold]{genome_b}[/] -> {json.dumps(b_agg.as_dict())}")
+    console.print(f"comparison: {comparison.summary()}")
+
+
+def get_domain_for_dataset(dataset: DatasetVersion):
+    prefix = dataset.challenges[0].challenge_id.split("-")[0]
+    mapping = {"fs": "forge-support", "sql": "sql-agent", "ra": "research-agent"}
+    return get_domain(mapping.get(prefix, "forge-support"))
+
+
+# --- promotion ---------------------------------------------------------
+
+
+@promotion_cmd.command("request")
+def promotion_request(genome_hash: str, experiment_id: str) -> None:
+    with session_scope() as session:
+        record = get_experiment(session, experiment_id)
+        if record is None or record.result is None:
+            raise typer.BadParameter(f"experiment '{experiment_id}' has no completed result yet")
+        result = record.result
+        from neuroforge.evaluation.aggregate import AggregateMetrics
+        from neuroforge.evaluation.statistics import Conclusion
+
+        baseline_agg = AggregateMetrics(genome_hash="baseline", n_evaluations=0, metrics=result["baseline_metrics"])
+        candidate_agg = AggregateMetrics(genome_hash=genome_hash, n_evaluations=0, metrics=result["best_metrics"])
+        from neuroforge.evaluation.statistics import ComparisonResult
+
+        comparison = ComparisonResult(
+            mean_diff=result["comparison"]["mean_diff"],
+            relative_diff=result["comparison"]["relative_diff"],
+            ci_low=result["comparison"]["ci_low"],
+            ci_high=result["comparison"]["ci_high"],
+            effect_size=result["comparison"]["effect_size"],
+            confidence=result["comparison"]["confidence"],
+            conclusion=Conclusion(result["comparison"]["conclusion"]),
+        )
+        decision = evaluate_promotion(
+            baseline_agg, candidate_agg, comparison, PromotionGateConfig(), SafetyConstraints()
+        )
+        save_promotion_decision(session, genome_hash, experiment_id, decision)
+    console.print(f"approved={decision.approved} next_status={decision.next_status.value}")
+    for reason in decision.reasons:
+        console.print(f"- {reason}")
+
+
+# --- canary --------------------------------------------------------------
+
+
+@canary_cmd.command("run")
+def canary_run(
+    baseline_ident: str,
+    candidate_ident: str,
+    dataset_id: str,
+    traffic_fraction: float = 0.10,
+    n_requests: int = 200,
+) -> None:
+    with session_scope() as session:
+        baseline = _resolve_genome(session, baseline_ident)
+        candidate = _resolve_genome(session, candidate_ident)
+        dataset = latest_dataset_version(session, dataset_id)
+        if dataset is None:
+            raise typer.BadParameter(f"unknown dataset '{dataset_id}'")
+
+        domain = get_domain_for_dataset(dataset)
+        provider = get_provider("mock")
+        traffic = (dataset.split("validation") + dataset.split("train"))[:n_requests]
+        result = simulate_canary(domain, provider, baseline, candidate, traffic, traffic_fraction)
+        save_canary_result(session, candidate.hash(), baseline.hash(), result)
+
+    console.print(f"rollback_triggered={result.rollback_triggered}")
+    for reason in result.reasons:
+        console.print(f"- {reason}")
+    console.print(f"baseline: {json.dumps(result.baseline_metrics.as_dict())}")
+    console.print(f"candidate: {json.dumps(result.candidate_metrics.as_dict())}")
+
+
+if __name__ == "__main__":
+    app()

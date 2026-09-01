@@ -1,0 +1,37 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  python-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install uv pip-audit
+      - run: |
+          uv pip install --system -e ".[dev]"
+          uv pip install --system -e ./apps/api
+      - name: pip-audit (report only — do not fail the build on advisories in transitive deps)
+        run: pip-audit --skip-editable || true
+
+  npm-audit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: apps/dashboard/package-lock.json
+      - run: npm ci
+      - name: npm audit (report only)
+        run: npm audit --production || true

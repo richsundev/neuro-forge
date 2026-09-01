@@ -1,0 +1,115 @@
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+export function apiKey(): string {
+  if (typeof window === "undefined") return "";
+  return window.localStorage.getItem("neuroforge_api_key") ?? "";
+}
+
+export function setApiKey(key: string): void {
+  if (typeof window !== "undefined") {
+    window.localStorage.setItem("neuroforge_api_key", key);
+  }
+}
+
+export async function apiGet<T>(path: string): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { "X-API-Key": apiKey() },
+    cache: "no-store",
+  });
+  if (!res.ok) {
+    throw new Error(`GET ${path} failed: ${res.status} ${await res.text()}`);
+  }
+  return res.json();
+}
+
+export async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "X-API-Key": apiKey(), "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error(`POST ${path} failed: ${res.status} ${await res.text()}`);
+  }
+  return res.json();
+}
+
+export interface ApplicationSummary {
+  id: string;
+  name: string;
+  domain: string;
+  created_at: string;
+}
+
+export interface ExperimentSummary {
+  experiment_id: string;
+  domain: string;
+  strategy: string;
+  status: string;
+  created_at: string;
+}
+
+export interface ExperimentDetail {
+  experiment_id: string;
+  status: string;
+  config: Record<string, unknown>;
+  result: ExperimentResult | null;
+}
+
+export interface ComparisonResult {
+  mean_diff: number;
+  relative_diff: number;
+  ci_low: number;
+  ci_high: number;
+  effect_size: number;
+  confidence: number;
+  conclusion: string;
+  summary: string;
+}
+
+export interface ExperimentResult {
+  experiment_id: string;
+  status: string;
+  stop_reason: string;
+  generations_completed: number;
+  candidates_evaluated: number;
+  baseline_genome: Record<string, unknown>;
+  best_genome: Record<string, unknown>;
+  baseline_metrics: Record<string, number>;
+  best_metrics: Record<string, number>;
+  comparison: ComparisonResult;
+  budget_utilization: Record<string, number>;
+  fitness_history: number[];
+  recommendation: string;
+}
+
+export interface LineageNode {
+  hash: string;
+  version: number;
+  generation: number;
+  status: string;
+  parent_hash: string | null;
+  mutations: string[];
+}
+
+export interface LineageGraph {
+  nodes: LineageNode[];
+  edges: { from: string; to: string }[];
+}
+
+export interface CandidateEvaluation {
+  genome_hash: string;
+  version: number;
+  generation: number;
+  fitness: number;
+  metrics: Record<string, number>;
+  is_pareto_optimal: boolean;
+}
+
+export interface DatasetSummary {
+  dataset_id: string;
+  version: number;
+  source: string;
+  n_challenges: number;
+  difficulty_score: number;
+}

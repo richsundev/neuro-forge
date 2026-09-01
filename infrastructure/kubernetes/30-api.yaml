@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neuroforge-api
+  namespace: neuroforge
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: neuroforge-api }
+  template:
+    metadata:
+      labels: { app: neuroforge-api }
+    spec:
+      containers:
+        - name: api
+          image: neuroforge-api:latest
+          ports:
+            - containerPort: 8000
+          envFrom:
+            - configMapRef: { name: neuroforge-config }
+            - secretRef: { name: neuroforge-secrets }
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+          volumeMounts:
+            - name: state
+              mountPath: /data/neuroforge_state
+      volumes:
+        - name: state
+          persistentVolumeClaim: { claimName: neuroforge-state }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: neuroforge-state
+  namespace: neuroforge
+spec:
+  accessModes: ["ReadWriteMany"]
+  resources: { requests: { storage: 5Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neuroforge-api
+  namespace: neuroforge
+spec:
+  selector: { app: neuroforge-api }
+  ports:
+    - port: 8000
+      targetPort: 8000
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: neuroforge-api
+  namespace: neuroforge
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: neuroforge-api
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: 70 }

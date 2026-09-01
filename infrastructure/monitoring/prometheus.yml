@@ -1,0 +1,14 @@
+# Scrapes the NeuroForge API's /metrics endpoint (prometheus_client, see
+# apps/api/neuroforge_api/main.py). Exists to operate NeuroForge itself — not a general-purpose
+# observability product (section 49) — request count/latency by path/method/status only.
+#
+# Usage: docker run -v $(pwd)/infrastructure/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml \
+#          -p 9090:9090 prom/prometheus
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: neuroforge-api
+    static_configs:
+      - targets: ["api:8000"] # "localhost:8000" if running the API outside docker-compose
+    metrics_path: /metrics

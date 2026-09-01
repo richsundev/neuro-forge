@@ -1,0 +1,19 @@
+# Run once per deploy (kubectl apply then kubectl wait, or as a Helm/Argo pre-install hook in a
+# fuller setup). Not automated here — see docs/development.md for what a real CD pipeline adds.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: neuroforge-migrate
+  namespace: neuroforge
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: neuroforge-api:latest
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - configMapRef: { name: neuroforge-config }
+            - secretRef: { name: neuroforge-secrets }

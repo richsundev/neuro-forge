@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neuroforge-worker
+  namespace: neuroforge
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: neuroforge-worker }
+  template:
+    metadata:
+      labels: { app: neuroforge-worker }
+    spec:
+      containers:
+        - name: worker
+          image: neuroforge-worker:latest
+          envFrom:
+            - configMapRef: { name: neuroforge-config }
+            - secretRef: { name: neuroforge-secrets }
+          resources:
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+          volumeMounts:
+            - name: state
+              mountPath: /data/neuroforge_state
+      volumes:
+        - name: state
+          persistentVolumeClaim: { claimName: neuroforge-state }
