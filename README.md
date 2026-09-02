@@ -72,6 +72,12 @@ score can't be won by gaming a fixed, easy dataset:
 
 ![Challenge Evolution](docs/images/challenge-evolution.png)
 
+**Promotion** — request promotion and run a canary from the UI; the two checks are genuinely
+independent (this candidate passed promotion gates on its validation-split evaluation, then
+canary caught a real policy-violation rate on a larger sample and rolled it back):
+
+![Promotion](docs/images/promotions.png)
+
 ---
 
 ## Architecture
@@ -127,6 +133,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 | Canary simulation + automatic rollback | ✅ | `promotion/canary.py` |
 | Evolution Graph (signature feature) | ✅ | dashboard `/genomes/[systemId]` |
 | Challenge Evolution (signature feature) | ✅ | dashboard `/datasets` |
+| Promotion page (candidates, canary, history) — drives promotion/canary from the UI, not just CLI | ✅ | dashboard `/promotions` |
 | 3 domain plugins (support/SQL/research agent) | ✅ | `domains/` |
 | Deterministic mock provider + real provider adapters | ✅ | `providers/` |
 | REST API (17 endpoints, OpenAPI, auth, rate limiting) | ✅ | `apps/api/` |
@@ -180,8 +187,11 @@ neuroforge promotion request <best-hash> exp-1        # PROMOTE or a specific re
 ```
 
 Or drive the same flow from the dashboard: create the experiment via the API, watch it on
-`/experiments/exp-1` (fitness curve + Pareto frontier, live), then `/genomes/support-agent` for
-the Evolution Graph.
+`/experiments/exp-1` (fitness curve + Pareto frontier, live), `/genomes/support-agent` for the
+Evolution Graph, then `/promotions` to request promotion and run a canary with a click — no CLI
+needed for that last step. The two checks are genuinely independent: a candidate can pass
+promotion gates on its validation-split evaluation and still get caught by canary on a larger,
+different traffic sample — that's not a bug, it's the point of having both.
 
 ## Documentation
 

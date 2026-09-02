@@ -98,6 +98,52 @@ def test_full_workflow_via_api(client):
     assert resp.status_code == 200
     assert len(resp.json()["nodes"]) >= 1
 
+    # The enriched experiment list should surface enough to drive a Promotion page without
+    # the frontend having to fetch every experiment's full detail.
+    resp = c.get("/api/v1/experiments", headers=headers)
+    assert resp.status_code == 200
+    listed = next(e for e in resp.json() if e["experiment_id"] == "exp-api-test")
+    from neuroforge.genomes.schema import SystemGenome
+
+    assert listed["best_genome_hash"] == SystemGenome.model_validate(result["best_genome"]).hash()
+    assert listed["recommendation"] == result["recommendation"]
+    assert listed["comparison_summary"] == result["comparison"]["summary"]
+
+    best_hash = listed["best_genome_hash"]
+    resp = c.post(
+        "/api/v1/promotions",
+        json={"genome_hash": best_hash, "experiment_id": "exp-api-test"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    decision = resp.json()
+    assert "approved" in decision and "reasons" in decision
+
+    resp = c.get("/api/v1/promotions", headers=headers)
+    assert resp.status_code == 200
+    promotions = resp.json()
+    assert any(p["genome_hash"] == best_hash and p["experiment_id"] == "exp-api-test" for p in promotions)
+
+    resp = c.post(
+        "/api/v1/canaries",
+        json={
+            "baseline_hash": "support-agent@v1",
+            "candidate_hash": best_hash,
+            "dataset_id": "support-agent-dataset",
+            "traffic_fraction": 0.3,
+            "n_requests": 40,
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    canary_result = resp.json()
+    assert "rollback_triggered" in canary_result
+
+    resp = c.get("/api/v1/canaries", headers=headers)
+    assert resp.status_code == 200
+    canaries = resp.json()
+    assert any(cn["candidate_hash"] == best_hash for cn in canaries)
+
 
 def test_viewer_role_cannot_create_application(client):
     c, admin_key = client

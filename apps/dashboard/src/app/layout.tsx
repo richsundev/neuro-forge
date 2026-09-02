@@ -24,6 +24,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
                 <Link href="/datasets" className="hover:text-accent">
                   Challenge Evolution
                 </Link>
+                <Link href="/promotions" className="hover:text-accent">
+                  Promotion
+                </Link>
               </nav>
               <span className="ml-auto text-xs text-slate-400">
                 autonomous experimentation, not observability

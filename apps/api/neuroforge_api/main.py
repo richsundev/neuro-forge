@@ -24,8 +24,10 @@ from neuroforge.db.repository import (
     get_experiment,
     get_genome,
     latest_dataset_version,
+    list_canary_runs,
     list_experiments,
     list_genomes_for_system,
+    list_promotion_decisions,
     save_canary_result,
     save_dataset_version,
     save_experiment,
@@ -160,6 +162,16 @@ def _resolve_genome(session, ident: str) -> SystemGenome:
 def _domain_for_dataset(dataset) -> str:
     prefix = dataset.challenges[0].challenge_id.split("-")[0]
     return {"fs": "forge-support", "sql": "sql-agent", "ra": "research-agent"}.get(prefix, "forge-support")
+
+
+def _best_genome_hash(result: dict | None) -> str | None:
+    """The content hash isn't stored as a field on the serialized genome (it's computed, not
+    persisted — see genomes/schema.py) so recompute it here for display/action in the dashboard.
+    `promotion_decisions.genome_hash` is a real foreign key into system_genomes.hash, so callers
+    that pass this on to POST /promotions need the actual hash, not a "system_id@vN" identifier."""
+    if not result or not result.get("best_genome"):
+        return None
+    return SystemGenome.model_validate(result["best_genome"]).hash()
 
 
 # --- applications ------------------------------------------------------
@@ -300,10 +312,14 @@ def list_experiments_endpoint(principal: Principal = Depends(require_role("viewe
         return [
             {
                 "experiment_id": r.experiment_id,
+                "application_id": r.application_id,
                 "domain": r.domain_name,
                 "strategy": r.search_strategy,
                 "status": r.status,
                 "created_at": r.created_at.isoformat(),
+                "best_genome_hash": _best_genome_hash(r.result),
+                "recommendation": (r.result or {}).get("recommendation"),
+                "comparison_summary": ((r.result or {}).get("comparison") or {}).get("summary"),
             }
             for r in rows
         ]
@@ -482,6 +498,23 @@ def request_promotion(body: PromotionRequest, principal: Principal = Depends(req
     return decision.model_dump(mode="json")
 
 
+@app.get("/api/v1/promotions", tags=["promotions"])
+def list_promotions_endpoint(principal: Principal = Depends(require_role("viewer"))) -> list[dict]:
+    with session_scope() as session:
+        rows = list_promotion_decisions(session)
+        return [
+            {
+                "genome_hash": r.genome_hash,
+                "experiment_id": r.experiment_id,
+                "approved": r.approved,
+                "next_status": r.next_status,
+                "reasons": r.reasons,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
 # --- canaries --------------------------------------------------------------
 
 
@@ -505,6 +538,23 @@ def run_canary(body: CanaryRequest, principal: Principal = Depends(require_role(
         "rollback_triggered": result.rollback_triggered,
         "reasons": result.reasons,
     }
+
+
+@app.get("/api/v1/canaries", tags=["canaries"])
+def list_canaries_endpoint(principal: Principal = Depends(require_role("viewer"))) -> list[dict]:
+    with session_scope() as session:
+        rows = list_canary_runs(session)
+        return [
+            {
+                "baseline_hash": r.baseline_hash,
+                "candidate_hash": r.candidate_hash,
+                "traffic_split": r.traffic_split,
+                "rollback_triggered": r.rollback_triggered,
+                "result": r.result,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
 
 
 # --- api keys (admin only) --------------------------------------------

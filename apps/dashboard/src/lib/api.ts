@@ -43,10 +43,14 @@ export interface ApplicationSummary {
 
 export interface ExperimentSummary {
   experiment_id: string;
+  application_id: string;
   domain: string;
   strategy: string;
   status: string;
   created_at: string;
+  best_genome_hash: string | null;
+  recommendation: string | null;
+  comparison_summary: string | null;
 }
 
 export interface ExperimentDetail {
@@ -112,4 +116,34 @@ export interface DatasetSummary {
   source: string;
   n_challenges: number;
   difficulty_score: number;
+}
+
+export interface PromotionDecision {
+  approved: boolean;
+  next_status: string;
+  reasons: string[];
+}
+
+export interface PromotionRecord {
+  genome_hash: string;
+  experiment_id: string | null;
+  approved: boolean;
+  next_status: string;
+  reasons: string[];
+  created_at: string;
+}
+
+export interface CanaryRecord {
+  baseline_hash: string;
+  candidate_hash: string;
+  traffic_split: number;
+  rollback_triggered: boolean;
+  result: {
+    baseline_metrics: Record<string, number>;
+    candidate_metrics: Record<string, number>;
+    reasons: string[];
+    n_baseline_requests: number;
+    n_candidate_requests: number;
+  };
+  created_at: string;
 }

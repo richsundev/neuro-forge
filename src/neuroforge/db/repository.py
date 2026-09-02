@@ -157,3 +157,13 @@ def save_canary_result(session: Session, candidate_hash: str, baseline_hash: str
     )
     session.add(record)
     return record
+
+
+def list_promotion_decisions(session: Session) -> list[PromotionRecord]:
+    stmt = select(PromotionRecord).order_by(PromotionRecord.created_at.desc())
+    return list(session.scalars(stmt))
+
+
+def list_canary_runs(session: Session) -> list[CanaryRecord]:
+    stmt = select(CanaryRecord).order_by(CanaryRecord.created_at.desc())
+    return list(session.scalars(stmt))
