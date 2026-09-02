@@ -87,6 +87,21 @@ class PromotionRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
+class PromotionApprovalRecord(Base):
+    """A human's explicit sign-off that moves a genome to PROMOTED — separate from
+    PromotionRecord, which logs the automated gate decision. Requiring both an approved gate
+    decision *and* a row here is what makes PROMOTED reachable only through an explicit,
+    attributable human action (see docs/promotion.md)."""
+
+    __tablename__ = "promotion_approvals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    genome_hash: Mapped[str] = mapped_column(String(32), ForeignKey("system_genomes.hash"), index=True)
+    experiment_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    approved_by: Mapped[str] = mapped_column(String(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
 class CanaryRecord(Base):
     __tablename__ = "canary_runs"
 

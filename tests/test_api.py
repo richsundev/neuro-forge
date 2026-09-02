@@ -145,6 +145,151 @@ def test_full_workflow_via_api(client):
     assert any(cn["candidate_hash"] == best_hash for cn in canaries)
 
 
+def test_promotion_finalize_requires_admin_approval_and_passed_canary(client):
+    """The human-approval gate (docs/promotion.md): PROMOTED must be unreachable without both an
+    approved promotion decision and a non-rollback canary on record, and only an admin-role key
+    may cross it — mirrors the CLI's `neuroforge promotion promote`."""
+    c, admin_key = client
+    headers = {"X-API-Key": admin_key}
+
+    c.post(
+        "/api/v1/applications",
+        json={"id": "support-agent", "name": "Forge Support", "domain": "forge-support"},
+        headers=headers,
+    ).raise_for_status()
+    c.post(
+        "/api/v1/datasets",
+        json={"dataset_id": "support-agent-dataset", "domain": "forge-support", "n": 40, "seed": 1},
+        headers=headers,
+    ).raise_for_status()
+    resp = c.post(
+        "/api/v1/experiments",
+        json={
+            "experiment_id": "exp-finalize-test",
+            "system_id": "support-agent",
+            "domain": "forge-support",
+            "strategy": "random",
+            "seed": 3,
+            "batch_size": 8,
+            "max_batches": 3,
+            "budget": {
+                "max_candidates": 16,
+                "max_requests": 100000,
+                "max_cost_usd": 100,
+                "max_duration_minutes": 30,
+            },
+        },
+        headers=headers,
+    )
+    resp.raise_for_status()
+    resp = c.post("/api/v1/experiments/exp-finalize-test/run", headers=headers)
+    resp.raise_for_status()
+
+    from neuroforge.genomes.schema import PromotionStatus, SystemGenome
+
+    best_hash = SystemGenome.model_validate(resp.json()["best_genome"]).hash()
+
+    # No promotion decision on record yet.
+    resp = c.post(
+        "/api/v1/promotions/finalize",
+        json={"genome_hash": best_hash, "experiment_id": "exp-finalize-test"},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+    # Seed a deterministic approved decision and a passed canary directly, rather than relying on
+    # this random-strategy experiment's own (uncertain) gate/canary outcome for a positive-path test.
+    from neuroforge.db.repository import save_canary_result, save_promotion_decision
+    from neuroforge.db.session import session_scope
+    from neuroforge.evaluation.aggregate import AggregateMetrics
+    from neuroforge.promotion.canary import CanaryResult
+    from neuroforge.promotion.gates import PromotionDecision as GateDecision
+
+    with session_scope() as session:
+        save_promotion_decision(
+            session,
+            best_hash,
+            "exp-finalize-test",
+            GateDecision(approved=True, next_status=PromotionStatus.APPROVED, reasons=["ok"]),
+        )
+
+    # Decision approved, but no canary yet.
+    resp = c.post(
+        "/api/v1/promotions/finalize",
+        json={"genome_hash": best_hash, "experiment_id": "exp-finalize-test"},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+    agg = AggregateMetrics(genome_hash=best_hash, n_evaluations=10, metrics={"quality": 0.8})
+    with session_scope() as session:
+        save_canary_result(
+            session,
+            best_hash,
+            "support-agent@v1",
+            CanaryResult(
+                baseline_metrics=agg,
+                candidate_metrics=agg,
+                traffic_split=0.1,
+                n_baseline_requests=9,
+                n_candidate_requests=1,
+                rollback_triggered=True,
+                reasons=["contrived rollback"],
+            ),
+        )
+
+    # Decision approved, but the latest canary triggered a rollback.
+    resp = c.post(
+        "/api/v1/promotions/finalize",
+        json={"genome_hash": best_hash, "experiment_id": "exp-finalize-test"},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+    with session_scope() as session:
+        save_canary_result(
+            session,
+            best_hash,
+            "support-agent@v1",
+            CanaryResult(
+                baseline_metrics=agg,
+                candidate_metrics=agg,
+                traffic_split=0.1,
+                n_baseline_requests=9,
+                n_candidate_requests=1,
+                rollback_triggered=False,
+                reasons=["canary within thresholds"],
+            ),
+        )
+
+    # Viewer/operator keys cannot finalize even once the gates are satisfied — admin only.
+    resp = c.post(
+        "/api/v1/api-keys", json={"name": "ops", "role": "operator"}, headers=headers
+    )
+    operator_key = resp.json()["api_key"]
+    resp = c.post(
+        "/api/v1/promotions/finalize",
+        json={"genome_hash": best_hash, "experiment_id": "exp-finalize-test"},
+        headers={"X-API-Key": operator_key},
+    )
+    assert resp.status_code == 403
+
+    resp = c.post(
+        "/api/v1/promotions/finalize",
+        json={"genome_hash": best_hash, "experiment_id": "exp-finalize-test"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "PROMOTED"
+    assert body["approved_by"] == "bootstrap-admin"
+
+    resp = c.get("/api/v1/promotions/approvals", headers=headers)
+    assert resp.status_code == 200
+    approvals = resp.json()
+    assert any(a["genome_hash"] == best_hash and a["approved_by"] == "bootstrap-admin" for a in approvals)
+
+
 def test_viewer_role_cannot_create_application(client):
     c, admin_key = client
     resp = c.post(

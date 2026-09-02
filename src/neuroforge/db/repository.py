@@ -13,6 +13,7 @@ from neuroforge.db.models import (
     DatasetVersionRecord,
     ExperimentRecord,
     GenomeRecord,
+    PromotionApprovalRecord,
     PromotionRecord,
 )
 from neuroforge.experiments.engine import ExperimentConfig, ExperimentResult
@@ -164,6 +165,46 @@ def list_promotion_decisions(session: Session) -> list[PromotionRecord]:
     return list(session.scalars(stmt))
 
 
+def latest_promotion_decision(session: Session, genome_hash: str) -> PromotionRecord | None:
+    stmt = (
+        select(PromotionRecord)
+        .where(PromotionRecord.genome_hash == genome_hash)
+        .order_by(PromotionRecord.created_at.desc())
+        .limit(1)
+    )
+    return session.scalar(stmt)
+
+
 def list_canary_runs(session: Session) -> list[CanaryRecord]:
     stmt = select(CanaryRecord).order_by(CanaryRecord.created_at.desc())
+    return list(session.scalars(stmt))
+
+
+def latest_canary_run(session: Session, candidate_hash: str) -> CanaryRecord | None:
+    stmt = (
+        select(CanaryRecord)
+        .where(CanaryRecord.candidate_hash == candidate_hash)
+        .order_by(CanaryRecord.created_at.desc())
+        .limit(1)
+    )
+    return session.scalar(stmt)
+
+
+def set_genome_status(session: Session, genome_hash: str, status: str) -> GenomeRecord | None:
+    record = session.get(GenomeRecord, genome_hash)
+    if record is not None:
+        record.status = status
+    return record
+
+
+def save_promotion_approval(
+    session: Session, genome_hash: str, experiment_id: str | None, approved_by: str
+) -> PromotionApprovalRecord:
+    record = PromotionApprovalRecord(genome_hash=genome_hash, experiment_id=experiment_id, approved_by=approved_by)
+    session.add(record)
+    return record
+
+
+def list_promotion_approvals(session: Session) -> list[PromotionApprovalRecord]:
+    stmt = select(PromotionApprovalRecord).order_by(PromotionApprovalRecord.created_at.desc())
     return list(session.scalars(stmt))

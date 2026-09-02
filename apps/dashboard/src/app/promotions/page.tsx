@@ -6,6 +6,7 @@ import {
   apiPost,
   type CanaryRecord,
   type ExperimentSummary,
+  type PromotionApproval,
   type PromotionDecision,
   type PromotionRecord,
 } from "@/lib/api";
@@ -20,9 +21,13 @@ function StatusBadge({ ok, okLabel = "approved", badLabel = "rejected" }: { ok: 
 
 function CandidateRow({
   experiment,
+  promotions,
+  canaries,
   onActionComplete,
 }: {
   experiment: ExperimentSummary;
+  promotions: PromotionRecord[];
+  canaries: CanaryRecord[];
   onActionComplete: () => void;
 }) {
   const [decision, setDecision] = useState<PromotionDecision | null>(null);
@@ -34,6 +39,14 @@ function CandidateRow({
   const [nRequests, setNRequests] = useState(200);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [promoted, setPromoted] = useState<{ approved_by: string } | null>(null);
+
+  // Promotions/canaries are sorted newest-first by the API, so the first match is the latest —
+  // this reads server truth rather than only this row's own local state, so eligibility survives
+  // a page reload instead of resetting whenever `decision`/`canaryResult` go back to null.
+  const latestDecision = promotions.find((p) => p.genome_hash === experiment.best_genome_hash);
+  const latestCanary = canaries.find((c) => c.candidate_hash === experiment.best_genome_hash);
+  const canPromote = !!latestDecision?.approved && !!latestCanary && !latestCanary.rollback_triggered;
 
   const datasetId = `${experiment.application_id}-dataset`;
   const baselineIdent = `${experiment.application_id}@v1`;
@@ -80,6 +93,24 @@ function CandidateRow({
     }
   }
 
+  async function finalizePromotion() {
+    if (!experiment.best_genome_hash) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await apiPost<{ genome_hash: string; status: string; approved_by: string }>(
+        "/api/v1/promotions/finalize",
+        { genome_hash: experiment.best_genome_hash, experiment_id: experiment.experiment_id }
+      );
+      setPromoted(result);
+      onActionComplete();
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="border-t border-slate-100 py-4">
       <div className="flex flex-wrap items-center gap-3">
@@ -99,6 +130,18 @@ function CandidateRow({
             className="rounded-md border border-slate-300 px-3 py-1.5 text-xs font-medium hover:bg-slate-50 disabled:opacity-40"
           >
             Run canary
+          </button>
+          <button
+            disabled={busy || !canPromote || !!promoted}
+            onClick={finalizePromotion}
+            title={
+              canPromote
+                ? "Requires an admin-role API key"
+                : "Requires an approved promotion decision and a passed (non-rollback) canary run first"
+            }
+            className="rounded-md bg-good px-3 py-1.5 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
+          >
+            Promote to production
           </button>
         </span>
       </div>
@@ -173,6 +216,19 @@ function CandidateRow({
           </ul>
         </div>
       )}
+
+      {promoted && (
+        <div className="mt-2 rounded-md border border-slate-200 p-3 text-sm">
+          <StatusBadge ok okLabel="promoted to production" /> approved by{" "}
+          <span className="font-mono text-xs">{promoted.approved_by}</span>
+        </div>
+      )}
+      {!promoted && latestCanary && !latestCanary.rollback_triggered && latestDecision?.approved && (
+        <p className="mt-2 text-sm text-slate-500">
+          Passed promotion gates and canary — awaiting an admin&rsquo;s explicit &ldquo;Promote to
+          production&rdquo;.
+        </p>
+      )}
     </div>
   );
 }
@@ -181,18 +237,21 @@ export default function PromotionsPage() {
   const [experiments, setExperiments] = useState<ExperimentSummary[]>([]);
   const [promotions, setPromotions] = useState<PromotionRecord[]>([]);
   const [canaries, setCanaries] = useState<CanaryRecord[]>([]);
+  const [approvals, setApprovals] = useState<PromotionApproval[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   async function load() {
     try {
-      const [e, p, c] = await Promise.all([
+      const [e, p, c, a] = await Promise.all([
         apiGet<ExperimentSummary[]>("/api/v1/experiments"),
         apiGet<PromotionRecord[]>("/api/v1/promotions"),
         apiGet<CanaryRecord[]>("/api/v1/canaries"),
+        apiGet<PromotionApproval[]>("/api/v1/promotions/approvals"),
       ]);
       setExperiments(e.filter((x) => x.status === "completed" && x.recommendation));
       setPromotions(p);
       setCanaries(c);
+      setApprovals(a);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
@@ -203,12 +262,14 @@ export default function PromotionsPage() {
   // remount every CandidateRow and drop its in-progress local state (open canary form, etc).
   async function refreshHistory() {
     try {
-      const [p, c] = await Promise.all([
+      const [p, c, a] = await Promise.all([
         apiGet<PromotionRecord[]>("/api/v1/promotions"),
         apiGet<CanaryRecord[]>("/api/v1/canaries"),
+        apiGet<PromotionApproval[]>("/api/v1/promotions/approvals"),
       ]);
       setPromotions(p);
       setCanaries(c);
+      setApprovals(a);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -241,8 +302,46 @@ export default function PromotionsPage() {
           <p className="text-sm text-slate-500">No completed experiments with a recommendation yet.</p>
         ) : (
           experiments.map((e) => (
-            <CandidateRow key={e.experiment_id} experiment={e} onActionComplete={refreshHistory} />
+            <CandidateRow
+              key={e.experiment_id}
+              experiment={e}
+              promotions={promotions}
+              canaries={canaries}
+              onActionComplete={refreshHistory}
+            />
           ))
+        )}
+      </section>
+
+      <section className="card">
+        <h2 className="mb-3 text-base font-semibold">Production promotions</h2>
+        <p className="mb-2 text-xs text-slate-500">
+          Each row is an explicit admin action — this is the human-approval gate between a passed
+          canary and PROMOTED.
+        </p>
+        {approvals.length === 0 ? (
+          <p className="text-sm text-slate-500">Nothing has been promoted to production yet.</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="text-left text-slate-500">
+              <tr>
+                <th className="pb-2">genome</th>
+                <th className="pb-2">experiment</th>
+                <th className="pb-2">approved by</th>
+                <th className="pb-2">when</th>
+              </tr>
+            </thead>
+            <tbody>
+              {approvals.map((a, i) => (
+                <tr key={i} className="border-t border-slate-100">
+                  <td className="py-1.5 font-mono text-xs">{a.genome_hash}</td>
+                  <td className="py-1.5">{a.experiment_id}</td>
+                  <td className="py-1.5">{a.approved_by}</td>
+                  <td className="py-1.5 text-slate-500">{new Date(a.created_at).toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         )}
       </section>
 

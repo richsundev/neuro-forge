@@ -43,6 +43,11 @@ class PromotionRequest(BaseModel):
     experiment_id: str
 
 
+class PromoteRequest(BaseModel):
+    genome_hash: str
+    experiment_id: str | None = None
+
+
 class CanaryRequest(BaseModel):
     baseline_hash: str
     candidate_hash: str

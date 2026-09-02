@@ -133,6 +133,13 @@ export interface PromotionRecord {
   created_at: string;
 }
 
+export interface PromotionApproval {
+  genome_hash: string;
+  experiment_id: string | null;
+  approved_by: string;
+  created_at: string;
+}
+
 export interface CanaryRecord {
   baseline_hash: string;
   candidate_hash: string;

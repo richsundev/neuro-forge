@@ -19,20 +19,25 @@ from prometheus_client import CollectorRegistry, Counter, Histogram, generate_la
 from sqlalchemy import select
 
 from neuroforge.datasets.evolution import evolve_if_saturated, seed_dataset
-from neuroforge.db.models import ApiKeyRecord, ApplicationRecord, DatasetVersionRecord
+from neuroforge.db.models import ApiKeyRecord, ApplicationRecord, DatasetVersionRecord, GenomeRecord
 from neuroforge.db.repository import (
     get_experiment,
     get_genome,
+    latest_canary_run,
     latest_dataset_version,
+    latest_promotion_decision,
     list_canary_runs,
     list_experiments,
     list_genomes_for_system,
+    list_promotion_approvals,
     list_promotion_decisions,
     save_canary_result,
     save_dataset_version,
     save_experiment,
     save_genome,
+    save_promotion_approval,
     save_promotion_decision,
+    set_genome_status,
     upsert_application,
 )
 from neuroforge.db.session import init_db, session_scope
@@ -47,7 +52,7 @@ from neuroforge.experiments.events import EventLog
 from neuroforge.experiments.queue import enqueue_experiment
 from neuroforge.experiments.spaces import search_space_for_domain
 from neuroforge.genomes.lineage import GenomeStore
-from neuroforge.genomes.schema import SystemGenome
+from neuroforge.genomes.schema import PromotionStatus, SystemGenome
 from neuroforge.observability import configure_tracing, get_tracer
 from neuroforge.promotion.canary import simulate_canary
 from neuroforge.promotion.gates import PromotionGateConfig, evaluate_promotion
@@ -68,6 +73,7 @@ from neuroforge_api.schemas import (
     DatasetEvolveRequest,
     DatasetSeedRequest,
     ExperimentCreateRequest,
+    PromoteRequest,
     PromotionRequest,
 )
 
@@ -509,6 +515,45 @@ def list_promotions_endpoint(principal: Principal = Depends(require_role("viewer
                 "approved": r.approved,
                 "next_status": r.next_status,
                 "reasons": r.reasons,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ]
+
+
+@app.post("/api/v1/promotions/finalize", tags=["promotions"])
+def finalize_promotion(body: PromoteRequest, principal: Principal = Depends(require_role("admin"))) -> dict:
+    """The human-approval gate between a passed canary and PROMOTED (see docs/promotion.md):
+    everything up to here (`request_promotion`, `run_canary`) can be run by an `operator` key —
+    the kind CI/automation holds — but only an `admin` key can take a candidate live, and doing so
+    is recorded in `promotion_approvals` against the caller's own name so it's always attributable
+    to a specific person, not just "the pipeline"."""
+    with session_scope() as session:
+        if session.get(GenomeRecord, body.genome_hash) is None:
+            raise HTTPException(404, f"unknown genome '{body.genome_hash}'")
+        decision = latest_promotion_decision(session, body.genome_hash)
+        if decision is None or not decision.approved:
+            raise HTTPException(400, "no approved promotion decision on record for this genome")
+        canary = latest_canary_run(session, body.genome_hash)
+        if canary is None:
+            raise HTTPException(400, "no canary run on record for this genome — run a canary before promoting")
+        if canary.rollback_triggered:
+            raise HTTPException(400, "the latest canary run triggered a rollback — cannot promote")
+        set_genome_status(session, body.genome_hash, PromotionStatus.PROMOTED.value)
+        save_promotion_approval(session, body.genome_hash, body.experiment_id, principal.name)
+    audit(principal.name, "finalize_promotion", {"genome_hash": body.genome_hash})
+    return {"genome_hash": body.genome_hash, "status": PromotionStatus.PROMOTED.value, "approved_by": principal.name}
+
+
+@app.get("/api/v1/promotions/approvals", tags=["promotions"])
+def list_promotion_approvals_endpoint(principal: Principal = Depends(require_role("viewer"))) -> list[dict]:
+    with session_scope() as session:
+        rows = list_promotion_approvals(session)
+        return [
+            {
+                "genome_hash": r.genome_hash,
+                "experiment_id": r.experiment_id,
+                "approved_by": r.approved_by,
                 "created_at": r.created_at.isoformat(),
             }
             for r in rows

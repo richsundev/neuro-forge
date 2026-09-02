@@ -74,7 +74,9 @@ score can't be won by gaming a fixed, easy dataset:
 
 **Promotion** — request promotion and run a canary from the UI; the two checks are genuinely
 independent (this candidate passed promotion gates on its validation-split evaluation, then
-canary caught a real policy-violation rate on a larger sample and rolled it back):
+canary caught a real policy-violation rate on a larger sample and rolled it back). Note the
+"Promote to production" button stays disabled until an approved decision *and* a passed canary
+are both on record — that's the human-approval gate, and only an admin-role key can cross it:
 
 ![Promotion](docs/images/promotions.png)
 
@@ -134,9 +136,10 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 | Evolution Graph (signature feature) | ✅ | dashboard `/genomes/[systemId]` |
 | Challenge Evolution (signature feature) | ✅ | dashboard `/datasets` |
 | Promotion page (candidates, canary, history) — drives promotion/canary from the UI, not just CLI | ✅ | dashboard `/promotions` |
+| Human-approval gate before PROMOTED (admin-role only, attributed and logged) | ✅ | `POST /api/v1/promotions/finalize`, `promotion_approvals` |
 | 3 domain plugins (support/SQL/research agent) | ✅ | `domains/` |
 | Deterministic mock provider + real provider adapters | ✅ | `providers/` |
-| REST API (17 endpoints, OpenAPI, auth, rate limiting) | ✅ | `apps/api/` |
+| REST API (26 endpoints, OpenAPI, auth, rate limiting) | ✅ | `apps/api/` |
 | CLI (Typer) | ✅ | `neuroforge` / `src/neuroforge/cli/` |
 | Async worker via Redis queue | ✅ | `scripts/worker.py`, [ADR-0010](docs/adr/0010-redis-queue-not-celery.md) |
 | Docker Compose (6 services, verified working) | ✅ | `docker-compose.yml` |
@@ -153,7 +156,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 **Backend**: Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0, Alembic, PostgreSQL (SQLite for
 local/CI), Redis, NumPy/SciPy. **Frontend**: Next.js 14 (App Router), TypeScript (strict),
 Tailwind CSS, Recharts. **Infra**: Docker Compose, Kubernetes, GitHub Actions. **Testing**:
-pytest (75 tests), mypy (strict), Ruff, ESLint, tsc.
+pytest (76 tests), mypy (strict), Ruff, ESLint, tsc.
 
 ## Quick start
 
@@ -168,7 +171,7 @@ docker compose up --build
 # Option B — local dev
 uv venv --python 3.12 .venv && uv pip install -e ".[dev]" -e ./apps/api
 cd apps/dashboard && npm install && cd ../..
-make test              # 75 tests, mock mode, no external services, ~3s
+make test              # 76 tests, mock mode, no external services, ~3s
 make reproduce           # full reproducible experiment -> reproduce_output/
 ```
 
@@ -184,14 +187,17 @@ neuroforge genome show support-agent@v1          # inspect the baseline
 neuroforge candidate compare support-agent@v1 <best-hash> support-agent-dataset
 neuroforge canary run support-agent@v1 <best-hash> support-agent-dataset
 neuroforge promotion request <best-hash> exp-1        # PROMOTE or a specific rejection reason
+neuroforge promotion promote <best-hash>              # human-approval gate — only if approved + canary passed
 ```
 
 Or drive the same flow from the dashboard: create the experiment via the API, watch it on
 `/experiments/exp-1` (fitness curve + Pareto frontier, live), `/genomes/support-agent` for the
-Evolution Graph, then `/promotions` to request promotion and run a canary with a click — no CLI
-needed for that last step. The two checks are genuinely independent: a candidate can pass
+Evolution Graph, then `/promotions` to request promotion, run a canary, and — only once both have
+succeeded — click "Promote to production" (requires an admin-role API key), all with no CLI
+needed. The two checks upstream of that button are genuinely independent: a candidate can pass
 promotion gates on its validation-split evaluation and still get caught by canary on a larger,
-different traffic sample — that's not a bug, it's the point of having both.
+different traffic sample — that's not a bug, it's the point of having both, and it's exactly what
+gates the final promote action too.
 
 ## Documentation
 
@@ -207,8 +213,10 @@ different traffic sample — that's not a bug, it's the point of having both.
 - The mock provider is a calibrated simulation, not a live model — see
   [ADR-0011](docs/adr/0011-deterministic-mock-provider.md). Real-provider adapters
   (`providers/compatible.py`) are structurally complete but untested against live traffic.
-- No human-approval gate between `APPROVED` and `PROMOTED` — a real deployment pipeline should add
-  one. See [docs/development.md](docs/development.md).
+- The human-approval gate before `PROMOTED` (`POST /api/v1/promotions/finalize`, admin-role only —
+  see [docs/promotion.md](docs/promotion.md)) simulates traffic shifting rather than actually
+  moving live traffic; a real deployment pipeline would wire it to a feature-flag/traffic-routing
+  layer.
 - The async worker is a plain Redis queue, not Celery — no retries/backoff/dead-letter queue yet.
   See [ADR-0010](docs/adr/0010-redis-queue-not-celery.md).
 - `NEUROFORGE_STATE_DIR` needs `ReadWriteMany` storage in Kubernetes (EFS/Filestore/NFS) since both
@@ -217,9 +225,9 @@ different traffic sample — that's not a bug, it's the point of having both.
 
 ## Roadmap
 
-Real-provider evaluation calibration, a human-approval promotion step, Celery-grade worker
-retries, per-viewer saved dashboard views, and a fourth domain plugin (multi-turn conversation
-agent) are the next candidates — see the open items in [docs/development.md](docs/development.md).
+Real-provider evaluation calibration, Celery-grade worker retries, per-viewer saved dashboard
+views, and a fourth domain plugin (multi-turn conversation agent) are the next candidates — see
+the open items in [docs/development.md](docs/development.md).
 
 ---
 

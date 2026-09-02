@@ -5,6 +5,7 @@ no logic lives here that isn't also reachable programmatically.
 from __future__ import annotations
 
 import json
+import os
 
 import typer
 from rich.console import Console
@@ -17,14 +18,18 @@ from neuroforge.db.models import ExperimentRecord
 from neuroforge.db.repository import (
     get_experiment,
     get_genome,
+    latest_canary_run,
     latest_dataset_version,
+    latest_promotion_decision,
     list_experiments,
     list_genomes_for_system,
     save_canary_result,
     save_dataset_version,
     save_experiment,
     save_genome,
+    save_promotion_approval,
     save_promotion_decision,
+    set_genome_status,
     upsert_application,
 )
 from neuroforge.db.session import init_db, session_scope
@@ -34,7 +39,7 @@ from neuroforge.evaluation.statistics import compare
 from neuroforge.experiments.checkpoint import ExperimentCheckpoint
 from neuroforge.experiments.engine import ExperimentConfig, ExperimentEngine
 from neuroforge.experiments.spaces import search_space_for_domain
-from neuroforge.genomes.schema import SystemGenome
+from neuroforge.genomes.schema import PromotionStatus, SystemGenome
 from neuroforge.promotion.canary import simulate_canary
 from neuroforge.promotion.gates import PromotionGateConfig, evaluate_promotion
 from neuroforge.promotion.safety import SafetyConstraints
@@ -357,6 +362,27 @@ def promotion_request(genome_hash: str, experiment_id: str) -> None:
     console.print(f"approved={decision.approved} next_status={decision.next_status.value}")
     for reason in decision.reasons:
         console.print(f"- {reason}")
+
+
+@promotion_cmd.command("promote")
+def promotion_promote(genome_hash: str, experiment_id: str | None = None) -> None:
+    """The human-approval gate between a passed canary and PROMOTED — requires both an approved
+    promotion decision and a non-rollback canary run already on record (see docs/promotion.md).
+    Mirrors POST /api/v1/promotions/finalize, which requires an admin-role API key for the same
+    reason: this is the one step meant to need an explicit, attributable human action."""
+    approved_by = os.environ.get("USER", "cli")
+    with session_scope() as session:
+        decision = latest_promotion_decision(session, genome_hash)
+        if decision is None or not decision.approved:
+            raise typer.BadParameter("no approved promotion decision on record for this genome")
+        canary = latest_canary_run(session, genome_hash)
+        if canary is None:
+            raise typer.BadParameter("no canary run on record for this genome — run a canary before promoting")
+        if canary.rollback_triggered:
+            raise typer.BadParameter("the latest canary run triggered a rollback — cannot promote")
+        set_genome_status(session, genome_hash, PromotionStatus.PROMOTED.value)
+        save_promotion_approval(session, genome_hash, experiment_id, approved_by)
+    console.print(f"status={PromotionStatus.PROMOTED.value} approved_by={approved_by}")
 
 
 # --- canary --------------------------------------------------------------

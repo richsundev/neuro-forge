@@ -16,6 +16,7 @@ neuroforge_state/
 node_modules/
 .next/
 out/
+*.tsbuildinfo
 apps/dashboard/.env.local
 
 reproduce_output/
