@@ -50,8 +50,9 @@ for the general class, not just these two instances.
 An experiment interrupted (crash, budget hit, manual cancel) and resumed later reaches the *same*
 state as an uninterrupted run with the same total budget — because the search strategy is
 reconstructed fresh and every historical `tell()` batch is replayed into it in original order (see
-docs/experimentation.md). `tests/test_experiment_engine.py::test_resume_reproduces_uninterrupted_run`
-verifies this directly: stop at 8 candidates, resume to 24, and diff against a straight run to 24.
+docs/experimentation.md). `tests/test_regressions.py::test_resume_reproduces_an_uninterrupted_run_for_every_strategy`
+verifies this directly for all five strategies: stop at 8 candidates, resume to 24, and diff against
+a straight run to 24. (Replay covers `ask()` as well as `tell()` — see ADR-0008's correction.)
 
 ## What is and isn't covered
 

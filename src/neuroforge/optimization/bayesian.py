@@ -82,6 +82,14 @@ class BayesianSearchStrategy(SearchStrategy):
                 break
         return chosen
 
+    def replay_ask(self, n: int) -> None:
+        # `ask` fits a GP (O(n^3) in observations so far) only to *rank* a pool; its effect on
+        # state is just the RNG draws for the pool. Replaying every historical batch through the
+        # full `ask` made resuming a long run cost far more than the run itself.
+        draws = n if len(self._points) < self.n_initial_random else self.candidate_pool_size
+        for _ in range(draws):
+            self.space.sample(self._rng)
+
     def _posterior(
         self, X_train: np.ndarray, y_train: np.ndarray, X_test: list[np.ndarray]
     ) -> tuple[np.ndarray, np.ndarray]:

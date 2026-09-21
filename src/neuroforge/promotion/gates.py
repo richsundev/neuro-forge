@@ -131,11 +131,16 @@ def evaluate_promotion(
     cost_increase = _fractional_increase(baseline.cost_usd, candidate.cost_usd)
     latency_increase = _fractional_increase(baseline.latency_ms, candidate.latency_ms)
 
-    if (
-        gates.require_statistically_significant_improvement
-        and comparison.conclusion != Conclusion.LIKELY_IMPROVEMENT
-    ):
-        reasons.append(f"statistical comparison did not confirm improvement: {comparison.conclusion.value}")
+    if gates.require_statistically_significant_improvement:
+        if comparison.conclusion != Conclusion.LIKELY_IMPROVEMENT:
+            reasons.append(f"statistical comparison did not confirm improvement: {comparison.conclusion.value}")
+        # `min_confidence` was configurable but never consulted: a comparison run at a laxer
+        # confidence than the gate demands proves less than the gate assumes.
+        if comparison.confidence < gates.min_confidence:
+            reasons.append(
+                f"statistical comparison was run at {comparison.confidence:.0%} confidence, below the "
+                f"required {gates.min_confidence:.0%}"
+            )
 
     # Regression guard: a large single-metric gain paired with a disproportionate loss elsewhere.
     if quality - baseline.metrics.get("quality", 0.0) > 0 and (

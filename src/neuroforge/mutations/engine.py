@@ -45,11 +45,20 @@ class MutationEngine:
             chosen_ops = self._rng.sample(op_names, k=min(n_changes, len(op_names)))
 
             proposals: list[MutationProposal] = []
+            touched: set[str] = set()
             for op_name in chosen_ops:
                 options = OPERATORS[op_name](genome)
-                options = [o for o in options if self.policy.is_allowed(o.field_path)]
+                # Two operators can target one field (add_constraint and simplify both rewrite the
+                # system prompt). `overrides` is keyed by field, so the later change would silently
+                # replace the earlier one while both stayed in the lineage records — a record for a
+                # change that was never applied. One change per field per candidate.
+                options = [
+                    o for o in options if self.policy.is_allowed(o.field_path) and o.field_path not in touched
+                ]
                 if options:
-                    proposals.append(self._rng.choice(options))
+                    proposal = self._rng.choice(options)
+                    touched.add(proposal.field_path)
+                    proposals.append(proposal)
 
             if not proposals:
                 continue

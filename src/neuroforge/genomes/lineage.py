@@ -4,7 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from neuroforge.genomes.schema import SystemGenome
+from neuroforge.genomes.schema import MutationRecord, SystemGenome
+
+
+def _clip(value: object, limit: int = 48) -> str:
+    text = repr(value)
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _describe(m: MutationRecord) -> str:
+    """`mutation_type` alone is useless in the graph — every search-proposed change has the same
+    type ("evolutionary.propose"), so a genome with 14 changes listed the same string 14 times."""
+    return f"{m.field_path}: {_clip(m.old_value)} → {_clip(m.new_value)}"
 
 
 @dataclass
@@ -56,7 +67,7 @@ class GenomeStore:
                 "generation": g.generation,
                 "status": g.status.value,
                 "parent_hash": g.parent_hash,
-                "mutations": [m.mutation_type for m in g.mutations],
+                "mutations": [_describe(m) for m in g.mutations],
             }
             for g in genomes
         ]

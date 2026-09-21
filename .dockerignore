@@ -1,0 +1,18 @@
+# Keep the build context (and anything COPY'd wholesale, like apps/dashboard) free of local
+# state: a host node_modules/.next would overwrite the image's own platform-specific install, and
+# .env files / the local SQLite database (which holds hashed API keys) must never be baked in.
+.git
+.venv
+**/node_modules
+**/.next
+**/__pycache__
+**/*.pyc
+.mypy_cache
+.ruff_cache
+.pytest_cache
+neuroforge.db
+neuroforge_state
+reproduce_output
+**/.env
+**/.env.local
+**/tsconfig.tsbuildinfo

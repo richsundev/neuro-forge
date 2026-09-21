@@ -44,6 +44,21 @@ becomes the `stop_reason`. Duration is tracked cumulatively across resumes (`pri
 persisted in the checkpoint), so a budget genuinely caps wall-clock spend across a resumed run, not
 just the current process's uptime.
 
+## Running safely
+
+- **One run at a time.** `ExperimentEngine.run()` takes an exclusive advisory lock
+  (`<id>.lock`); a second run of the same experiment raises `ExperimentAlreadyRunning` (HTTP 409)
+  instead of interleaving checkpoint/event writes. The OS releases the lock if the holder dies, so
+  a crashed worker never blocks its own resume.
+- **Crash-safe files.** Checkpoints are written to a temp file and renamed into place; the event
+  log skips a torn final line (from a kill mid-append) instead of refusing to load.
+- **Failures are recorded.** `experiments/runner.py:run_recorded_experiment` — the single
+  implementation behind `POST /experiments/{id}/run`, `neuroforge experiment run` and the worker —
+  marks the experiment `running`, then `completed` or `failed`.
+- **Budgets don't overshoot.** The last batch is truncated to the candidates the budget has left.
+- **Early data check.** A dataset with no train data or fewer than 2 validation challenges is
+  refused up front rather than after the whole search.
+
 ## Cancellation
 
 `neuroforge experiment cancel <id>` (or `POST /api/v1/experiments/{id}/cancel`) touches a

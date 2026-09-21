@@ -171,7 +171,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 **Backend**: Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0, Alembic, PostgreSQL (SQLite for
 local/CI), Redis, NumPy/SciPy. **Frontend**: Next.js 14 (App Router), TypeScript (strict),
 Tailwind CSS, Recharts. **Infra**: Docker Compose, Kubernetes, GitHub Actions. **Testing**:
-pytest (91 tests), mypy (strict), Ruff, ESLint, tsc.
+pytest (125 tests), mypy (strict), Ruff, ESLint, tsc.
 
 ## Quick start
 
@@ -186,7 +186,7 @@ docker compose up --build
 # Option B — local dev
 uv venv --python 3.12 .venv && uv pip install -e ".[dev]" -e ./apps/api
 cd apps/dashboard && npm install && cd ../..
-make test              # 91 tests, mock mode, no external services, ~3s
+make test              # 125 tests, mock mode, no external services, ~15s
 make reproduce           # full reproducible experiment -> reproduce_output/
 ```
 
@@ -219,7 +219,7 @@ traffic, and a rejection at either names the exact limit that was missed.
 [architecture](docs/architecture.md) · [optimization](docs/optimization.md) ·
 [evolutionary search](docs/evolutionary-search.md) · [experimentation](docs/experimentation.md) ·
 [evaluation](docs/evaluation.md) · [datasets](docs/datasets.md) · [safety](docs/safety.md) ·
-[promotion](docs/promotion.md) · [reproducibility](docs/reproducibility.md) ·
+[promotion](docs/promotion.md) · [security](docs/security.md) · [reproducibility](docs/reproducibility.md) ·
 [performance](docs/performance.md) · [development](docs/development.md) ·
 [design decisions & ADRs](docs/design-decisions.md)
 

@@ -85,7 +85,33 @@ def default_search_space() -> SearchSpace:
     )
 
 
+BASE_RESEARCH_PROMPT = "You are a helpful research assistant."
+
+RESEARCH_PROMPT_VARIANTS = [
+    BASE_RESEARCH_PROMPT,
+    BASE_RESEARCH_PROMPT + "\n- Cite the specific source for every claim.",
+    BASE_RESEARCH_PROMPT
+    + "\n- Cite the specific source for every claim."
+    + "\n- When sources disagree, present each view and say so."
+    + "\n- If the evidence is insufficient, say so instead of guessing.",
+]
+
+
+def research_agent_search_space() -> SearchSpace:
+    """ResearchAgent scores hallucination resistance from the system prompt (a citing instruction),
+    so the prompt has to be a search dimension. Without it the domain's safety score on
+    no-evidence questions is fixed by the baseline prompt, and no search can ever satisfy the
+    default safety limit."""
+    space = default_search_space()
+    space.parameters["prompt.system_prompt"] = ParamSpec(
+        type="categorical", values=RESEARCH_PROMPT_VARIANTS
+    )
+    return space
+
+
 def search_space_for_domain(domain_name: str) -> SearchSpace:
     if domain_name == "forge-support":
         return forge_support_search_space()
+    if domain_name == "research-agent":
+        return research_agent_search_space()
     return default_search_space()

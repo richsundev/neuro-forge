@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s worker: %(message)s")
@@ -20,46 +21,18 @@ def _state_dir() -> Path:
 
 
 def run_one(experiment_id: str) -> None:
-    from neuroforge.db.repository import (
-        dataset_for_experiment,
-        get_experiment,
-        list_genomes_for_system,
-        save_experiment,
-        save_genome,
-    )
-    from neuroforge.db.session import session_scope
-    from neuroforge.experiments.engine import ExperimentConfig, ExperimentEngine
-    from neuroforge.genomes.schema import SystemGenome
+    from neuroforge.experiments.engine import ExperimentAlreadyRunning
+    from neuroforge.experiments.runner import RunnerError, run_recorded_experiment
 
-    with session_scope() as session:
-        record = get_experiment(session, experiment_id)
-        if record is None:
-            logger.error("unknown experiment %s, skipping", experiment_id)
-            return
-        config = ExperimentConfig.model_validate(record.config)
-        baseline = next(
-            (
-                SystemGenome.model_validate(r.data)
-                for r in list_genomes_for_system(session, record.application_id)
-                if r.version == 1
-            ),
-            None,
-        )
-        dataset = dataset_for_experiment(session, record.application_id, config)
-        application_id = record.application_id
-        save_experiment(session, application_id, config, status="running")
-
-    if baseline is None or dataset is None:
-        logger.error("experiment %s missing baseline/dataset, skipping", experiment_id)
+    logger.info("running experiment %s", experiment_id)
+    try:
+        result = run_recorded_experiment(experiment_id, _state_dir())
+    except RunnerError as exc:
+        logger.error("cannot run experiment %s: %s", experiment_id, exc)
         return
-
-    logger.info("running experiment %s (strategy=%s)", experiment_id, config.search_strategy)
-    engine = ExperimentEngine(config, baseline, dataset, _state_dir() / experiment_id)
-    result = engine.run()
-
-    with session_scope() as session:
-        save_genome(session, SystemGenome.model_validate(result.best_genome))
-        save_experiment(session, application_id, config, result=result, status=result.status)
+    except ExperimentAlreadyRunning:
+        logger.warning("experiment %s is already running elsewhere, skipping", experiment_id)
+        return
     logger.info("experiment %s finished: %s (%s)", experiment_id, result.status, result.stop_reason)
 
 
@@ -71,14 +44,21 @@ def main() -> None:
     configure_tracing("neuroforge-worker")
     init_db()
     logger.info("neuroforge-experiment-worker started, polling Redis queue")
+    failures = 0
     while True:
         try:
             experiment_id = dequeue_experiment(timeout=5)
+            failures = 0
             if experiment_id is None:
                 continue
             run_one(experiment_id)
         except Exception:
-            logger.exception("worker loop iteration failed, continuing")
+            # Back off: with Redis down, `dequeue_experiment` raises immediately, and retrying with
+            # no delay spun a CPU core and flooded the log.
+            failures += 1
+            delay = min(30.0, 0.5 * 2**min(failures, 6))
+            logger.exception("worker loop iteration failed (%d in a row), retrying in %.1fs", failures, delay)
+            time.sleep(delay)
 
 
 if __name__ == "__main__":

@@ -11,10 +11,11 @@ resumable through one mechanism instead of a bespoke serializer per strategy.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from neuroforge.genomes.schema import SystemGenome
 
@@ -39,6 +40,14 @@ class ExperimentCheckpoint(BaseModel):
     best_feasible: bool = False
     dataset_version_hash: str = ""
 
+    @field_validator("best_fitness", mode="before")
+    @classmethod
+    def _null_means_no_best_yet(cls, value: Any) -> Any:
+        # `best_fitness` starts at -inf, which pydantic writes as JSON `null` — and then refuses to
+        # read back into a float. An experiment stopped before its first generation (cancelled, or
+        # out of budget) saved exactly that and could never be loaded, resumed or inspected again.
+        return float("-inf") if value is None else value
+
     def generations_completed(self) -> int:
         return len(self.tell_batches)
 
@@ -46,8 +55,12 @@ class ExperimentCheckpoint(BaseModel):
         return sum(len(b.points) for b in self.tell_batches)
 
     def save(self, path: Path) -> None:
+        # Write-then-rename so a crash mid-write can never leave a truncated checkpoint behind: the
+        # reader sees either the previous complete file or the new complete one.
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.model_dump_json(indent=2))
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(self.model_dump_json(indent=2))
+        os.replace(tmp, path)
 
     @classmethod
     def load(cls, path: Path) -> ExperimentCheckpoint:

@@ -23,11 +23,13 @@ function CandidateRow({
   experiment,
   promotions,
   canaries,
+  approvals,
   onActionComplete,
 }: {
   experiment: ExperimentSummary;
   promotions: PromotionRecord[];
   canaries: CanaryRecord[];
+  approvals: PromotionApproval[];
   onActionComplete: () => void;
 }) {
   const [decision, setDecision] = useState<PromotionDecision | null>(null);
@@ -39,7 +41,7 @@ function CandidateRow({
   const [nRequests, setNRequests] = useState(200);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [promoted, setPromoted] = useState<{ approved_by: string } | null>(null);
+  const [justPromoted, setJustPromoted] = useState<{ approved_by: string } | null>(null);
 
   // Promotions/canaries are sorted newest-first by the API, so the first match is the latest —
   // this reads server truth rather than only this row's own local state, so eligibility survives
@@ -47,6 +49,10 @@ function CandidateRow({
   const latestDecision = promotions.find((p) => p.genome_hash === experiment.best_genome_hash);
   const latestCanary = canaries.find((c) => c.candidate_hash === experiment.best_genome_hash);
   const canPromote = !!latestDecision?.approved && !!latestCanary && !latestCanary.rollback_triggered;
+  // Promoted-ness comes from the server's approval records, not this row's local state: after a
+  // reload local state is gone, and the button used to re-enable for an already-promoted genome.
+  const existingApproval = approvals.find((a) => a.genome_hash === experiment.best_genome_hash);
+  const promoted = justPromoted ?? existingApproval ?? null;
 
   const datasetId = experiment.dataset_id;
   const baselineIdent = `${experiment.application_id}@v1`;
@@ -102,7 +108,7 @@ function CandidateRow({
         "/api/v1/promotions/finalize",
         { genome_hash: experiment.best_genome_hash, experiment_id: experiment.experiment_id }
       );
-      setPromoted(result);
+      setJustPromoted(result);
       onActionComplete();
     } catch (err) {
       setError((err as Error).message);
@@ -317,6 +323,7 @@ export default function PromotionsPage() {
               experiment={e}
               promotions={promotions}
               canaries={canaries}
+              approvals={approvals}
               onActionComplete={refreshHistory}
             />
           ))

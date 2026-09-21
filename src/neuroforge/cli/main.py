@@ -14,9 +14,7 @@ from rich.table import Table
 from neuroforge.cli.paths import state_dir
 from neuroforge.datasets.dataset import DatasetVersion
 from neuroforge.datasets.evolution import evolve_if_saturated, seed_dataset
-from neuroforge.db.models import ExperimentRecord
 from neuroforge.db.repository import (
-    dataset_for_experiment,
     genome_from_record,
     get_experiment,
     get_genome,
@@ -25,6 +23,7 @@ from neuroforge.db.repository import (
     latest_promotion_decision,
     list_experiments,
     list_genomes_for_system,
+    next_candidate_version,
     save_canary_result,
     save_dataset_version,
     save_experiment,
@@ -38,9 +37,11 @@ from neuroforge.domains import get_domain
 from neuroforge.evaluation.aggregate import aggregate
 from neuroforge.evaluation.statistics import compare
 from neuroforge.experiments.checkpoint import ExperimentCheckpoint
-from neuroforge.experiments.engine import ExperimentConfig, ExperimentEngine
+from neuroforge.experiments.engine import ExperimentAlreadyRunning, ExperimentConfig
+from neuroforge.experiments.runner import RunnerError, UnknownExperiment, run_recorded_experiment
 from neuroforge.experiments.spaces import search_space_for_domain
 from neuroforge.genomes.schema import PromotionStatus, SystemGenome
+from neuroforge.optimization import STRATEGY_REGISTRY
 from neuroforge.promotion.canary import fresh_traffic, simulate_canary
 from neuroforge.promotion.review import ReviewError, review_promotion
 from neuroforge.providers.registry import get_provider
@@ -74,6 +75,8 @@ def _init() -> None:
 def _resolve_genome(session, ident: str) -> SystemGenome:
     if "@v" in ident:
         system_id, version_str = ident.split("@v", 1)
+        if not version_str.isdigit():
+            raise typer.BadParameter(f"malformed genome identifier '{ident}' (expected <system>@v<number>)")
         records = list_genomes_for_system(session, system_id)
         for r in records:
             if r.version == int(version_str):
@@ -83,6 +86,13 @@ def _resolve_genome(session, ident: str) -> SystemGenome:
     if genome is None:
         raise typer.BadParameter(f"no genome found with hash {ident}")
     return genome
+
+
+def _domain_or_error(name: str):
+    try:
+        return get_domain(name)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 # --- app ---------------------------------------------------------------
@@ -123,8 +133,13 @@ def genome_show(ident: str) -> None:
 
 
 @dataset_cmd.command("seed")
-def dataset_seed(dataset_id: str, domain: str = "forge-support", n: int = 300, seed: int = 1) -> None:
-    d = get_domain(domain)
+def dataset_seed(
+    dataset_id: str,
+    domain: str = "forge-support",
+    n: int = typer.Option(300, min=20, max=5000, help="challenges to generate (validation/holdout are ~15% each)"),
+    seed: int = 1,
+) -> None:
+    d = _domain_or_error(domain)
     dataset = seed_dataset(d, dataset_id, n=n, seed=seed)
     with session_scope() as session:
         save_dataset_version(session, dataset)
@@ -183,8 +198,12 @@ def experiment_create(
     max_candidates: int = 200,
 ) -> None:
     dataset_id = dataset_id or f"{system_id}-dataset"
-    d = get_domain(domain)
+    d = _domain_or_error(domain)
+    if strategy not in STRATEGY_REGISTRY:
+        raise typer.BadParameter(f"unknown strategy '{strategy}'; known: {sorted(STRATEGY_REGISTRY)}")
     with session_scope() as session:
+        if get_experiment(session, experiment_id) is not None:
+            raise typer.BadParameter(f"experiment '{experiment_id}' already exists")
         upsert_application(session, system_id, system_id, domain)
         baseline = get_genome_by_system_version(session, system_id, 1)
         if baseline is None:
@@ -201,6 +220,7 @@ def experiment_create(
             experiment_id=experiment_id,
             domain_name=domain,
             dataset_id=dataset_id,
+            first_candidate_version=next_candidate_version(session, system_id),
             search_strategy=strategy,
             search_space=search_space_for_domain(domain),
             batch_size=batch_size,
@@ -221,22 +241,12 @@ def get_genome_by_system_version(session, system_id: str, version: int) -> Syste
 
 @experiment_cmd.command("run")
 def experiment_run(experiment_id: str) -> None:
-    with session_scope() as session:
-        record: ExperimentRecord | None = get_experiment(session, experiment_id)
-        if record is None:
-            raise typer.BadParameter(f"unknown experiment '{experiment_id}' — run `experiment create` first")
-        config = ExperimentConfig.model_validate(record.config)
-        baseline = get_genome_by_system_version(session, record.application_id, 1)
-        assert baseline is not None
-        dataset = dataset_for_experiment(session, record.application_id, config)
-        assert dataset is not None, "dataset missing — this should not happen if experiment was created via the CLI"
-
-    engine = ExperimentEngine(config, baseline, dataset, state_dir() / experiment_id)
-    result = engine.run()
-
-    with session_scope() as session:
-        save_genome(session, SystemGenome.model_validate(result.best_genome))
-        save_experiment(session, record.application_id, config, result=result, status=result.status)
+    try:
+        result = run_recorded_experiment(experiment_id, state_dir())
+    except UnknownExperiment as exc:
+        raise typer.BadParameter(f"{exc} — run `experiment create` first") from exc
+    except (RunnerError, ExperimentAlreadyRunning) as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
     console.print(f"[bold]{experiment_id}[/] finished: {result.status} ({result.stop_reason})")
     console.print(f"generations={result.generations_completed} candidates={result.candidates_evaluated}")
@@ -359,6 +369,9 @@ def promotion_promote(genome_hash: str, experiment_id: str | None = None) -> Non
     reason: this is the one step meant to need an explicit, attributable human action."""
     approved_by = os.environ.get("USER", "cli")
     with session_scope() as session:
+        current = get_genome(session, genome_hash)
+        if current is not None and current.status == PromotionStatus.PROMOTED:
+            raise typer.BadParameter("this genome is already promoted")
         decision = latest_promotion_decision(session, genome_hash)
         if decision is None or not decision.approved:
             raise typer.BadParameter("no approved promotion decision on record for this genome")

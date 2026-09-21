@@ -18,9 +18,16 @@ noise alone.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
 from pathlib import Path
+
+try:  # POSIX only; on other platforms runs are simply not mutually excluded
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 from pydantic import BaseModel, Field
 
@@ -43,6 +50,14 @@ from neuroforge.promotion.holdout import per_challenge_metrics
 from neuroforge.promotion.safety import SafetyConstraints, SafetyEstimate, estimate_safety
 from neuroforge.providers.registry import get_provider
 from neuroforge.util import get_field_by_path
+
+
+class ExperimentAlreadyRunning(RuntimeError):
+    """Another process (or thread) is currently running this experiment."""
+
+
+class DatasetTooSmall(ValueError):
+    """The dataset's splits can't support a search plus a validation comparison."""
 
 
 class ExperimentConfig(BaseModel):
@@ -69,6 +84,11 @@ class ExperimentConfig(BaseModel):
     # `<application_id>-dataset`. Recorded so a later promotion review evaluates the holdout of
     # the *same* dataset version this experiment used.
     dataset_id: str | None = None
+    # First version number given to this experiment's candidates. Every experiment used to number
+    # its candidates from baseline+1, so two experiments on one application both produced a "v141"
+    # — different genomes under one label, and `system@v141` resolved to whichever came first.
+    # Allocated at creation (see `next_candidate_version`); None keeps the old numbering.
+    first_candidate_version: int | None = Field(default=None, ge=2)
     # Search aims this far inside the *safety* limits so the winner has headroom against
     # split-to-split sampling noise (cost/latency/quality limits are near-deterministic functions
     # of the configuration, so they need no such buffer).
@@ -122,9 +142,30 @@ class ExperimentEngine:
         self.holdout_guard = HoldoutGuard(dataset_version.challenges)
         self._tracer = get_tracer("neuroforge.experiments")
 
+    @contextmanager
+    def _exclusive(self) -> Iterator[None]:
+        """Two runs of one experiment interleave checkpoint and event writes and corrupt both.
+        An advisory `flock` is the right primitive: the OS releases it when the holder dies, so a
+        crashed worker never leaves the experiment permanently locked (crash-resume must work)."""
+        if fcntl is None:  # pragma: no cover
+            yield
+            return
+        with (self.state_dir / f"{self.config.experiment_id}.lock").open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ExperimentAlreadyRunning(
+                    f"experiment '{self.config.experiment_id}' is already running"
+                ) from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
+
     def run(self) -> ExperimentResult:
-        with self._tracer.start_as_current_span(
-            "experiment.run", attributes={"experiment_id": self.config.experiment_id, "strategy": self.config.search_strategy}
+        with self._exclusive(), self._tracer.start_as_current_span(
+            "experiment.run",
+            attributes={"experiment_id": self.config.experiment_id, "strategy": self.config.search_strategy},
         ):
             return self._run()
 
@@ -161,6 +202,12 @@ class ExperimentEngine:
             batch_size=self.config.batch_size,
         )
         for batch in ckpt.tell_batches:
+            # Replay `ask()` as well as `tell()`: strategies keep ask-side state too (the RNG stream
+            # behind random/Bayesian proposals, the grid cursor, the bandit's pull counts). Replaying
+            # only `tell()` left that state at its initial value, so a resumed random search
+            # re-proposed the very points it had already evaluated and a resumed bandit lost every
+            # reward it had recorded. The stored points stay authoritative for `tell()`.
+            strategy.replay_ask(len(batch.points))
             strategy.tell(
                 [Observation(point=p, fitness=f) for p, f in zip(batch.points, batch.fitness, strict=True)]
             )
@@ -169,9 +216,20 @@ class ExperimentEngine:
         best_genome = ckpt.best_genome_obj() or self.baseline_genome
         best_fitness = ckpt.best_fitness
         best_feasible = ckpt.best_feasible
-        next_version = self.baseline_genome.version + 1 + ckpt.candidates_completed()
+        first_version = self.config.first_candidate_version or (self.baseline_genome.version + 1)
+        next_version = first_version + ckpt.candidates_completed()
         generation_index = ckpt.generations_completed()
         search_challenges = self.holdout_guard.search_set()
+        # Fail before spending the whole search budget: the final comparison needs paired validation
+        # samples, and a dataset whose split left validation (or train) nearly empty used to crash
+        # only at the very end with "cannot aggregate zero evaluation results".
+        n_validation = len(self.holdout_guard.validation_set())
+        if not search_challenges or n_validation < 2:
+            raise DatasetTooSmall(
+                f"dataset '{self.dataset_version.dataset_id}' v{self.dataset_version.version} has "
+                f"{len(search_challenges)} train and {n_validation} validation challenges; "
+                "need >= 1 train and >= 2 validation — seed a larger dataset"
+            )
         search_categories = [c.category for c in search_challenges]
         baseline_search_agg = aggregate(
             [self.domain.evaluate(self.baseline_genome, c, self.provider) for c in search_challenges],
@@ -201,7 +259,10 @@ class ExperimentEngine:
                 stop_reason = "max_batches reached"
                 break
 
-            points = strategy.ask(self.config.batch_size)
+            # Never propose more candidates than the budget has left — the budget is checked once per
+            # batch, so a full batch would overshoot max_candidates by up to batch_size - 1.
+            remaining = self.config.budget.max_candidates - budget_tracker.candidates_used
+            points = strategy.ask(min(self.config.batch_size, remaining))
             if not points:
                 stop_reason = "search space exhausted"
                 break

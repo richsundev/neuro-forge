@@ -32,6 +32,12 @@ class SearchStrategy(ABC):
     def tell(self, observations: list[Observation]) -> None:
         """Report fitness for previously-asked points so the strategy can adapt."""
 
+    def replay_ask(self, n: int) -> None:
+        """Advance ask-side state (RNG stream, cursor, pull counts) exactly as `ask(n)` did, when
+        resuming from a checkpoint whose points are already known. Defaults to calling `ask`;
+        strategies whose `ask` is expensive but whose state change is cheap override it."""
+        self.ask(n)
+
     def convergence(self) -> ConvergenceState:
         return ConvergenceState()
 

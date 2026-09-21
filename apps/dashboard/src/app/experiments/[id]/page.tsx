@@ -70,7 +70,7 @@ export default function ExperimentDetailPage() {
             <StatCard label="Generations" value={String(result.generations_completed)} />
             <StatCard label="Candidates evaluated" value={String(result.candidates_evaluated)} />
             <StatCard label="Quality change" value={pct(result.comparison.relative_diff)} />
-            <StatCard label="Conclusion" value={result.comparison.conclusion.replace("_", " ")} />
+            <StatCard label="Conclusion" value={result.comparison.conclusion.replaceAll("_", " ")} />
           </div>
 
           <div className="card">

@@ -33,15 +33,31 @@ def evolve_if_saturated(
 
     lo = min(0.95, current.difficulty_score + DIFFICULTY_STEP * 0.5)
     hi = min(1.0, current.difficulty_score + DIFFICULTY_STEP)
+    new_version = current.version + 1
     new_challenges = domain.generate_cases(n_new_challenges, (lo, hi), seed)
     valid = [c for c in new_challenges if domain.validate(c)]
-    combined = current.challenges + valid
-    combined = deterministic_split(combined, seed)
+
+    # Generated ids come from the seed, so evolving twice with the same seed (the API's default)
+    # regenerates ids that already exist: duplicated challenges, silently double-counted.
+    taken = {c.challenge_id for c in current.challenges}
+    unique = []
+    for c in valid:
+        cid = c.challenge_id
+        if cid in taken:
+            cid = f"{cid}-v{new_version}"
+        taken.add(cid)
+        unique.append(c.model_copy(update={"challenge_id": cid}))
+
+    # Only the *new* challenges get a split assignment. Existing challenges keep theirs: re-running
+    # `deterministic_split` over everything with a different seed moved ~45% of v1's challenges
+    # between train/validation/holdout, so a challenge that had been a candidate's held-out
+    # evidence could become search data in the next version.
+    combined = current.challenges + deterministic_split(unique, seed)
 
     difficulty_score = sum(c.difficulty for c in combined) / max(1, len(combined))
     return DatasetVersion(
         dataset_id=current.dataset_id,
-        version=current.version + 1,
+        version=new_version,
         parent_version=current.version,
         source="benchmark_evolution",
         challenges=combined,
@@ -55,6 +71,8 @@ def seed_dataset(
 ) -> DatasetVersion:
     challenges = domain.generate_cases(n, difficulty, seed)
     valid = [c for c in challenges if domain.validate(c)]
+    if not valid:
+        raise ValueError(f"no valid challenges could be generated for '{dataset_id}' (n={n})")
     split = deterministic_split(valid, seed)
     difficulty_score = sum(c.difficulty for c in split) / max(1, len(split))
     return DatasetVersion(

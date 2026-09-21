@@ -44,9 +44,23 @@ class EventLog:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._events: list[Event] = []
         if self.path.exists():
-            for line in self.path.read_text().splitlines():
-                if line.strip():
+            raw = self.path.read_text()
+            if raw and not raw.endswith("\n"):
+                # Terminate a torn final line so the next append starts on a fresh line instead of
+                # being glued onto the fragment (which would corrupt that event too).
+                with self.path.open("a") as f:
+                    f.write("\n")
+                raw += "\n"
+            for line in raw.splitlines():
+                if not line.strip():
+                    continue
+                try:
                     self._events.append(Event(**json.loads(line)))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    # A process killed mid-append leaves a torn final line. The log is append-only
+                    # and every complete event before it is still valid, so skip it rather than
+                    # making the whole experiment unresumable (see scripts/failures/worker_crash.py).
+                    continue
 
     def emit(self, event: Event) -> None:
         self._events.append(event)

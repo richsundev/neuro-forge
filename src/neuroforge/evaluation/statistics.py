@@ -35,7 +35,7 @@ class ComparisonResult:
         pct = self.relative_diff * 100
         return (
             f"{'+' if pct >= 0 else ''}{pct:.1f}% "
-            f"(95% CI [{self.ci_low * 100:+.1f}%, {self.ci_high * 100:+.1f}%]) -> "
+            f"({self.confidence:.0%} CI [{self.ci_low * 100:+.1f}%, {self.ci_high * 100:+.1f}%]) -> "
             f"{self.conclusion.value}"
         )
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from typing import Any
 
 from neuroforge.optimization.search_space import SearchSpace
@@ -8,18 +9,21 @@ from neuroforge.optimization.strategy import ConvergenceState, Observation, Sear
 
 class GridSearchStrategy(SearchStrategy):
     """Exhaustive (bounded) sweep over a discretized grid — good for small, bounded numeric
-    search spaces where completeness matters more than sample efficiency."""
+    search spaces where completeness matters more than sample efficiency. The grid is walked
+    lazily: it is never materialized, so a large space costs time proportional to the candidates
+    actually evaluated, not memory proportional to the whole grid."""
 
     name = "grid_search"
 
     def __init__(self, space: SearchSpace, steps: int = 4) -> None:
         self.space = space
-        self._grid = space.grid(steps)
+        self._total = space.grid_size(steps)
+        self._points = space.iter_grid(steps)
         self._cursor = 0
         self._history: list[float] = []
 
     def ask(self, n: int) -> list[dict[str, Any]]:
-        batch = self._grid[self._cursor : self._cursor + n]
+        batch = list(itertools.islice(self._points, max(0, n)))
         self._cursor += len(batch)
         return batch
 
@@ -27,7 +31,7 @@ class GridSearchStrategy(SearchStrategy):
         self._history.extend(o.fitness for o in observations)
 
     def exhausted(self) -> bool:
-        return self._cursor >= len(self._grid)
+        return self._cursor >= self._total
 
     def convergence(self) -> ConvergenceState:
         return ConvergenceState(

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from neuroforge.db.repository import (
@@ -83,7 +84,18 @@ def review_promotion(session: Session, experiment_id: str, genome_hash: str) -> 
             )
         except ValueError as exc:
             raise ReviewError(str(exc)) from exc
-        save_holdout_evaluation(session, genome_hash, experiment_id, evidence)
+        try:
+            # Savepoint: two simultaneous requests for one candidate both miss the lookup above and
+            # both try to insert; the unique constraint makes the loser fail, and it should simply
+            # use the winner's measurement (the whole point is that there is only one).
+            with session.begin_nested():
+                save_holdout_evaluation(session, genome_hash, experiment_id, evidence)
+        except IntegrityError:
+            winner = get_holdout_evaluation(session, genome_hash, dataset.dataset_id, dataset.version)
+            if winner is None:
+                raise
+            evidence = HoldoutEvidence.model_validate(winner.evidence)
+            stored = winner
 
     decision = decide_from_evidence(evidence, genome_hash, config.promotion_gates, config.safety_constraints)
     save_promotion_decision(session, genome_hash, experiment_id, decision)

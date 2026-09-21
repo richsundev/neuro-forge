@@ -126,9 +126,28 @@ def save_experiment(
         )
         session.add(record)
     record.status = status
+    # Always persist the config that was passed: it used to be written only when the row was
+    # created, so `experiment resume --extra-candidates` (which raises the budget in memory and
+    # saves) silently kept the old budget and the resumed run stopped immediately.
+    record.config = config.model_dump(mode="json")
     if result is not None:
         record.result = result.model_dump(mode="json")
     return record
+
+
+def next_candidate_version(session: Session, application_id: str) -> int:
+    """First version number not already used or reserved by this application's genomes and
+    experiments, so candidate version labels are unique across experiments."""
+    start = 2
+    for genome in list_genomes_for_system(session, application_id):
+        start = max(start, genome.version + 1)
+    stmt = select(ExperimentRecord).where(ExperimentRecord.application_id == application_id)
+    for record in session.scalars(stmt):
+        config = record.config or {}
+        first = config.get("first_candidate_version") or 2
+        reserved = (config.get("budget") or {}).get("max_candidates", 0)
+        start = max(start, first + reserved)
+    return start
 
 
 def get_experiment(session: Session, experiment_id: str) -> ExperimentRecord | None:
@@ -233,7 +252,7 @@ def save_canary_result(session: Session, candidate_hash: str, baseline_hash: str
 
 
 def list_promotion_decisions(session: Session) -> list[PromotionRecord]:
-    stmt = select(PromotionRecord).order_by(PromotionRecord.created_at.desc())
+    stmt = select(PromotionRecord).order_by(PromotionRecord.created_at.desc(), PromotionRecord.id.desc())
     return list(session.scalars(stmt))
 
 
@@ -241,14 +260,14 @@ def latest_promotion_decision(session: Session, genome_hash: str) -> PromotionRe
     stmt = (
         select(PromotionRecord)
         .where(PromotionRecord.genome_hash == genome_hash)
-        .order_by(PromotionRecord.created_at.desc())
+        .order_by(PromotionRecord.created_at.desc(), PromotionRecord.id.desc())
         .limit(1)
     )
     return session.scalar(stmt)
 
 
 def list_canary_runs(session: Session) -> list[CanaryRecord]:
-    stmt = select(CanaryRecord).order_by(CanaryRecord.created_at.desc())
+    stmt = select(CanaryRecord).order_by(CanaryRecord.created_at.desc(), CanaryRecord.id.desc())
     return list(session.scalars(stmt))
 
 
@@ -256,7 +275,7 @@ def latest_canary_run(session: Session, candidate_hash: str) -> CanaryRecord | N
     stmt = (
         select(CanaryRecord)
         .where(CanaryRecord.candidate_hash == candidate_hash)
-        .order_by(CanaryRecord.created_at.desc())
+        .order_by(CanaryRecord.created_at.desc(), CanaryRecord.id.desc())
         .limit(1)
     )
     return session.scalar(stmt)
@@ -278,5 +297,5 @@ def save_promotion_approval(
 
 
 def list_promotion_approvals(session: Session) -> list[PromotionApprovalRecord]:
-    stmt = select(PromotionApprovalRecord).order_by(PromotionApprovalRecord.created_at.desc())
+    stmt = select(PromotionApprovalRecord).order_by(PromotionApprovalRecord.created_at.desc(), PromotionApprovalRecord.id.desc())
     return list(session.scalars(stmt))

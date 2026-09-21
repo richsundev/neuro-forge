@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { apiKey, setApiKey } from "@/lib/api";
 
-export default function ApiKeyBar() {
+export default function ApiKeyBar({ onSaved }: { onSaved?: () => void }) {
   const [value, setValue] = useState("");
   const [saved, setSaved] = useState(false);
 
@@ -24,6 +24,7 @@ export default function ApiKeyBar() {
         className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white hover:opacity-90"
         onClick={() => {
           setApiKey(value);
+          onSaved?.(); // reload with the new key instead of leaving the old 401 on screen
           setSaved(true);
           setTimeout(() => setSaved(false), 1500);
         }}

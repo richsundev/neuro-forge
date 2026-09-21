@@ -39,3 +39,14 @@ of N batches is O(N × batch_size), still fast.
 resumed run and a straight-through run — see docs/reproducibility.md. `scripts/failures/
 worker_crash.py` demonstrates the same property against an actually-killed OS process, not just an
 in-process simulation.
+
+## Correction
+
+The original decision replayed only `tell()`. That reproduces *observation* state (evolutionary
+population, Bayesian training data) but not *proposal* state: random search's RNG stream, the grid
+cursor and the bandit's pull counts all advance in `ask()`. Resuming therefore re-proposed the
+points a random search had already evaluated and made a resumed bandit forget every reward — and
+the equivalence test only covered the evolutionary strategy, so the claim above was untested for
+the rest. The engine now replays `ask()` (via `SearchStrategy.replay_ask`, which Bayesian
+optimization overrides to skip the GP fit and only consume the RNG draws) before each `tell()`, and
+`test_resume_reproduces_an_uninterrupted_run_for_every_strategy` checks all five strategies.

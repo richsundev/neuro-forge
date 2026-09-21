@@ -17,8 +17,11 @@ def client(tmp_path, monkeypatch):
 
     importlib.reload(db_session_module)
 
+    import neuroforge_api.auth as api_auth
     import neuroforge_api.main as api_main
 
+    # Reload auth too: its rate limiters are module state that would otherwise leak between tests.
+    importlib.reload(api_auth)
     importlib.reload(api_main)
 
     api_main.init_db()
@@ -295,6 +298,14 @@ def test_promotion_finalize_requires_admin_approval_and_passed_canary(client):
     assert body["status"] == "PROMOTED"
     assert body["approved_by"] == "bootstrap-admin"
     assert genome_status() == "PROMOTED"
+    again = c.post(
+        "/api/v1/promotions/finalize",
+        json={"genome_hash": best_hash, "experiment_id": "exp-finalize-test"},
+        headers=headers,
+    )
+    assert again.status_code == 409
+    approvals_after = c.get("/api/v1/promotions/approvals", headers=headers).json()
+    assert len([a for a in approvals_after if a["genome_hash"] == best_hash]) == 1
 
     # PROMOTED is terminal: a later canary or repeat review must not downgrade a live genome.
     with session_scope() as session:

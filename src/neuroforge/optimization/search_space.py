@@ -8,7 +8,10 @@ random/grid/evolutionary/Bayesian/bandit strategies so they can be compared on e
 
 from __future__ import annotations
 
+import itertools
+import math
 import random
+from collections.abc import Iterator
 from typing import Any, Literal
 
 import numpy as np
@@ -58,6 +61,8 @@ class ParamSpec(BaseModel):
             span = int(hi) - int(lo)
             n = min(steps, span + 1)
             return sorted({int(lo + round(i * span / max(1, n - 1))) for i in range(n)})
+        if steps < 2:
+            return [round((lo + hi) / 2, 4)]
         return [round(lo + i * (hi - lo) / (steps - 1), 4) for i in range(steps)]
 
     def clamp(self, value: Any) -> Any:
@@ -106,9 +111,18 @@ class SearchSpace(BaseModel):
                 vec.append((value - lo) / span)
         return np.array(vec, dtype=float)
 
-    def grid(self, steps: int = 4) -> list[dict[str, Any]]:
-        import itertools
+    def grid_size(self, steps: int = 4) -> int:
+        """Number of points in the full grid, without materializing it."""
+        return math.prod(len(spec.grid_values(steps)) for spec in self.parameters.values())
 
+    def iter_grid(self, steps: int = 4) -> Iterator[dict[str, Any]]:
+        """Lazily walk the full grid. A realistic genome space has tens of millions of grid points
+        (ForgeSupport's 14 fields at 4 steps is ~22M), so building the list is an out-of-memory
+        crash, not a slow search."""
         names = list(self.parameters)
         value_lists = [self.parameters[n].grid_values(steps) for n in names]
-        return [dict(zip(names, combo, strict=True)) for combo in itertools.product(*value_lists)]
+        for combo in itertools.product(*value_lists):
+            yield dict(zip(names, combo, strict=True))
+
+    def grid(self, steps: int = 4) -> list[dict[str, Any]]:
+        return list(self.iter_grid(steps))

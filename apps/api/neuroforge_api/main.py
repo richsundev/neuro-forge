@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+import redis
+from fastapi import Depends, FastAPI, HTTPException, Path, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
@@ -21,7 +25,6 @@ from sqlalchemy import select
 from neuroforge.datasets.evolution import evolve_if_saturated, seed_dataset
 from neuroforge.db.models import ApiKeyRecord, ApplicationRecord, DatasetVersionRecord, GenomeRecord
 from neuroforge.db.repository import (
-    dataset_for_experiment,
     genome_from_record,
     get_experiment,
     get_genome,
@@ -33,6 +36,7 @@ from neuroforge.db.repository import (
     list_genomes_for_system,
     list_promotion_approvals,
     list_promotion_decisions,
+    next_candidate_version,
     save_canary_result,
     save_dataset_version,
     save_experiment,
@@ -48,9 +52,10 @@ from neuroforge.evaluation.pareto import ParetoPoint, pareto_frontier
 from neuroforge.evaluation.statistics import ComparisonResult, compare
 from neuroforge.experiments.budget import ExperimentBudget
 from neuroforge.experiments.checkpoint import ExperimentCheckpoint
-from neuroforge.experiments.engine import ExperimentConfig, ExperimentEngine
+from neuroforge.experiments.engine import ExperimentAlreadyRunning, ExperimentConfig
 from neuroforge.experiments.events import EventLog
 from neuroforge.experiments.queue import enqueue_experiment
+from neuroforge.experiments.runner import RunnerError, UnknownExperiment, run_recorded_experiment
 from neuroforge.experiments.spaces import search_space_for_domain
 from neuroforge.genomes.lineage import GenomeStore
 from neuroforge.genomes.schema import PromotionStatus, SystemGenome
@@ -68,6 +73,7 @@ from neuroforge_api.auth import (
     require_role,
 )
 from neuroforge_api.schemas import (
+    ID_PATTERN,
     ApiKeyCreateRequest,
     ApplicationCreate,
     CanaryRequest,
@@ -86,6 +92,8 @@ logger = logging.getLogger("neuroforge.api")
 DEFAULT_DATASET_SIZE = 300
 
 STATE_DIR_ENV = "NEUROFORGE_STATE_DIR"
+
+ExperimentId = Annotated[str, Path(pattern=ID_PATTERN)]
 
 METRICS_REGISTRY = CollectorRegistry()
 REQUEST_COUNT = Counter(
@@ -125,8 +133,13 @@ async def _metrics_and_logging(request: Request, call_next):
         response = await call_next(request)
         duration = time.perf_counter() - start
         span.set_attribute("http.status_code", response.status_code)
-    REQUEST_LATENCY.labels(path=request.url.path).observe(duration)
-    REQUEST_COUNT.labels(method=request.method, path=request.url.path, status=response.status_code).inc()
+    # Label by route *template*, not the raw URL: one series per experiment id (and one per random
+    # 404 path, unauthenticated) grows the metric registry without bound. Unmatched requests share
+    # a single label.
+    route = request.scope.get("route")
+    metric_path = getattr(route, "path", None) or "unmatched"
+    REQUEST_LATENCY.labels(path=metric_path).observe(duration)
+    REQUEST_COUNT.labels(method=request.method, path=metric_path, status=response.status_code).inc()
     logger.info(
         json.dumps(
             {
@@ -150,6 +163,15 @@ def metrics() -> str:
     return generate_latest(METRICS_REGISTRY).decode()
 
 
+def _iso_utc(moment: datetime) -> str:
+    """ISO-8601 with an explicit offset. SQLite hands back naive datetimes (it drops the timezone
+    the column was declared with), and a naive string is parsed by browsers as *local* time — so
+    every timestamp in the dashboard was shifted by the viewer's UTC offset."""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return moment.isoformat()
+
+
 def _state_dir():
     import os
     from pathlib import Path
@@ -160,6 +182,8 @@ def _state_dir():
 def _resolve_genome(session, ident: str) -> SystemGenome:
     if "@v" in ident:
         system_id, version_str = ident.split("@v", 1)
+        if not version_str.isdigit():
+            raise HTTPException(400, f"malformed genome identifier '{ident}' (expected <system>@v<number>)")
         for r in list_genomes_for_system(session, system_id):
             if r.version == int(version_str):
                 return genome_from_record(r)
@@ -171,6 +195,8 @@ def _resolve_genome(session, ident: str) -> SystemGenome:
 
 
 def _domain_for_dataset(dataset) -> str:
+    if not dataset.challenges:
+        raise HTTPException(400, f"dataset '{dataset.dataset_id}' has no challenges")
     prefix = dataset.challenges[0].challenge_id.split("-")[0]
     return {"fs": "forge-support", "sql": "sql-agent", "ra": "research-agent"}.get(prefix, "forge-support")
 
@@ -201,7 +227,7 @@ def list_applications(principal: Principal = Depends(require_role("viewer"))) ->
     with session_scope() as session:
         rows = list(session.scalars(select(ApplicationRecord)))
         return [
-            {"id": r.id, "name": r.name, "domain": r.domain_name, "created_at": r.created_at.isoformat()}
+            {"id": r.id, "name": r.name, "domain": r.domain_name, "created_at": _iso_utc(r.created_at)}
             for r in rows
         ]
 
@@ -220,7 +246,7 @@ def get_genome_endpoint(ident: str, principal: Principal = Depends(require_role(
 def list_genomes(system_id: str, principal: Principal = Depends(require_role("viewer"))) -> list[dict]:
     with session_scope() as session:
         rows = list_genomes_for_system(session, system_id)
-        return [SystemGenome.model_validate(r.data).model_dump(mode="json") for r in rows]
+        return [genome_from_record(r).model_dump(mode="json") for r in rows]
 
 
 @app.get("/api/v1/genomes/{system_id}/lineage", tags=["genomes"])
@@ -288,6 +314,16 @@ def create_experiment(body: ExperimentCreateRequest, principal: Principal = Depe
     dataset_id = body.dataset_id or f"{body.system_id}-dataset"
     domain = get_domain(body.domain)
     with session_scope() as session:
+        # Re-POSTing an existing id used to "succeed" and reset that experiment's status to
+        # "created" while keeping its old result and config.
+        if get_experiment(session, body.experiment_id) is not None:
+            raise HTTPException(409, f"experiment '{body.experiment_id}' already exists")
+        existing_app = session.get(ApplicationRecord, body.system_id)
+        if existing_app is not None and existing_app.domain_name != body.domain:
+            raise HTTPException(
+                400,
+                f"application '{body.system_id}' uses domain '{existing_app.domain_name}', not '{body.domain}'",
+            )
         upsert_application(session, body.system_id, body.system_id, body.domain)
         baseline = None
         for r in list_genomes_for_system(session, body.system_id):
@@ -305,6 +341,7 @@ def create_experiment(body: ExperimentCreateRequest, principal: Principal = Depe
             experiment_id=body.experiment_id,
             domain_name=body.domain,
             dataset_id=dataset_id,
+            first_candidate_version=next_candidate_version(session, body.system_id),
             search_strategy=body.strategy,
             search_space=search_space_for_domain(body.domain),
             batch_size=body.batch_size,
@@ -329,7 +366,7 @@ def list_experiments_endpoint(principal: Principal = Depends(require_role("viewe
                 "domain": r.domain_name,
                 "strategy": r.search_strategy,
                 "status": r.status,
-                "created_at": r.created_at.isoformat(),
+                "created_at": _iso_utc(r.created_at),
                 "best_genome_hash": _best_genome_hash(r.result),
                 "recommendation": (r.result or {}).get("recommendation"),
                 "comparison_summary": ((r.result or {}).get("comparison") or {}).get("summary"),
@@ -339,7 +376,7 @@ def list_experiments_endpoint(principal: Principal = Depends(require_role("viewe
 
 
 @app.get("/api/v1/experiments/{experiment_id}", tags=["experiments"])
-def get_experiment_endpoint(experiment_id: str, principal: Principal = Depends(require_role("viewer"))) -> dict:
+def get_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = Depends(require_role("viewer"))) -> dict:
     with session_scope() as session:
         record = get_experiment(session, experiment_id)
         if record is None:
@@ -353,34 +390,24 @@ def get_experiment_endpoint(experiment_id: str, principal: Principal = Depends(r
 
 
 @app.post("/api/v1/experiments/{experiment_id}/run", tags=["experiments"])
-def run_experiment_endpoint(experiment_id: str, principal: Principal = Depends(require_role("operator"))) -> dict:
-    with session_scope() as session:
-        record = get_experiment(session, experiment_id)
-        if record is None:
-            raise HTTPException(404, f"unknown experiment '{experiment_id}'")
-        config = ExperimentConfig.model_validate(record.config)
-        baseline = None
-        for r in list_genomes_for_system(session, record.application_id):
-            if r.version == 1:
-                baseline = SystemGenome.model_validate(r.data)
-        dataset = dataset_for_experiment(session, record.application_id, config)
-        application_id = record.application_id
-
-    if baseline is None or dataset is None:
-        raise HTTPException(400, "experiment is missing its baseline genome or dataset")
-
-    engine = ExperimentEngine(config, baseline, dataset, _state_dir() / experiment_id)
-    result = engine.run()
-
-    with session_scope() as session:
-        save_genome(session, SystemGenome.model_validate(result.best_genome))
-        save_experiment(session, application_id, config, result=result, status=result.status)
+def run_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = Depends(require_role("operator"))) -> dict:
+    try:
+        result = run_recorded_experiment(experiment_id, _state_dir())
+    except UnknownExperiment as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except RunnerError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ExperimentAlreadyRunning as exc:
+        raise HTTPException(409, str(exc)) from exc
     audit(principal.name, "run_experiment", {"experiment_id": experiment_id, "status": result.status})
     return result.model_dump(mode="json")
 
 
 @app.post("/api/v1/experiments/{experiment_id}/cancel", tags=["experiments"])
-def cancel_experiment_endpoint(experiment_id: str, principal: Principal = Depends(require_role("operator"))) -> dict:
+def cancel_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = Depends(require_role("operator"))) -> dict:
+    with session_scope() as session:
+        if get_experiment(session, experiment_id) is None:
+            raise HTTPException(404, f"unknown experiment '{experiment_id}'")
     flag = _state_dir() / experiment_id / f"{experiment_id}.cancel"
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.touch()
@@ -389,7 +416,7 @@ def cancel_experiment_endpoint(experiment_id: str, principal: Principal = Depend
 
 
 @app.post("/api/v1/experiments/{experiment_id}/enqueue", tags=["experiments"])
-def enqueue_experiment_endpoint(experiment_id: str, principal: Principal = Depends(require_role("operator"))) -> dict:
+def enqueue_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = Depends(require_role("operator"))) -> dict:
     """Hand the experiment to the neuroforge-experiment-worker via Redis instead of running it
     synchronously in this request — the async path used by the dashboard/production deployments."""
     with session_scope() as session:
@@ -397,14 +424,23 @@ def enqueue_experiment_endpoint(experiment_id: str, principal: Principal = Depen
         if record is None:
             raise HTTPException(404, f"unknown experiment '{experiment_id}'")
         config = ExperimentConfig.model_validate(record.config)
-        save_experiment(session, record.application_id, config, status="queued")
-    enqueue_experiment(experiment_id)
+        previous_status = record.status
+        application_id = record.application_id
+        save_experiment(session, application_id, config, status="queued")
+    try:
+        enqueue_experiment(experiment_id)
+    except redis.exceptions.RedisError as exc:
+        # Marked "queued" before pushing (a worker may pick the job up immediately and set
+        # "running"), so a failed push has to undo it or the experiment looks queued forever.
+        with session_scope() as session:
+            save_experiment(session, application_id, config, status=previous_status)
+        raise HTTPException(503, f"could not reach the job queue: {exc}") from exc
     audit(principal.name, "enqueue_experiment", {"experiment_id": experiment_id})
     return {"queued": True}
 
 
 @app.get("/api/v1/experiments/{experiment_id}/checkpoint", tags=["experiments"])
-def experiment_checkpoint_endpoint(experiment_id: str, principal: Principal = Depends(require_role("viewer"))) -> dict:
+def experiment_checkpoint_endpoint(experiment_id: ExperimentId, principal: Principal = Depends(require_role("viewer"))) -> dict:
     ckpt = ExperimentCheckpoint.load_or_none(_state_dir() / experiment_id / f"{experiment_id}.checkpoint.json")
     if ckpt is None:
         raise HTTPException(404, "no checkpoint yet — has this experiment been run?")
@@ -413,20 +449,24 @@ def experiment_checkpoint_endpoint(experiment_id: str, principal: Principal = De
         "stop_reason": ckpt.stop_reason,
         "generations_completed": ckpt.generations_completed(),
         "candidates_completed": ckpt.candidates_completed(),
-        "best_fitness": ckpt.best_fitness,
+        "best_fitness": ckpt.best_fitness if math.isfinite(ckpt.best_fitness) else None,
         "budget_state": ckpt.budget_state,
         "fitness_history": [f for b in ckpt.tell_batches for f in b.fitness],
     }
 
 
 @app.get("/api/v1/experiments/{experiment_id}/candidates", tags=["experiments"])
-def experiment_candidates(experiment_id: str, principal: Principal = Depends(require_role("viewer"))) -> dict:
+def experiment_candidates(experiment_id: ExperimentId, principal: Principal = Depends(require_role("viewer"))) -> dict:
     """Every evaluated candidate this run, with a quality-vs-cost Pareto frontier flag — powers
     the Pareto frontier chart (section 6/40)."""
     log_path = _state_dir() / experiment_id / f"{experiment_id}.events.jsonl"
     if not log_path.exists():
         raise HTTPException(404, "no events recorded yet for this experiment")
-    events = EventLog(log_path).of_type("CandidateEvaluated")
+    # A run that crashed mid-generation is regenerated on resume, which appends a second
+    # CandidateEvaluated for the same version — keep the latest per version so the chart and the
+    # Pareto flags aren't fed duplicates.
+    latest_by_version = {e.payload["version"]: e for e in EventLog(log_path).of_type("CandidateEvaluated")}
+    events = list(latest_by_version.values())
     points = [
         ParetoPoint(
             candidate_id=f"v{e.payload['version']}",
@@ -516,7 +556,7 @@ def list_promotions_endpoint(principal: Principal = Depends(require_role("viewer
                 "next_status": r.next_status,
                 "reasons": r.reasons,
                 "evidence": r.evidence or [],
-                "created_at": r.created_at.isoformat(),
+                "created_at": _iso_utc(r.created_at),
             }
             for r in rows
         ]
@@ -530,8 +570,12 @@ def finalize_promotion(body: PromoteRequest, principal: Principal = Depends(requ
     is recorded in `promotion_approvals` against the caller's own name so it's always attributable
     to a specific person, not just "the pipeline"."""
     with session_scope() as session:
-        if session.get(GenomeRecord, body.genome_hash) is None:
+        genome_record = session.get(GenomeRecord, body.genome_hash)
+        if genome_record is None:
             raise HTTPException(404, f"unknown genome '{body.genome_hash}'")
+        if genome_record.status == PromotionStatus.PROMOTED.value:
+            # Otherwise a second click (or a retry) recorded a second approval for the same action.
+            raise HTTPException(409, "this genome is already promoted")
         decision = latest_promotion_decision(session, body.genome_hash)
         if decision is None or not decision.approved:
             raise HTTPException(400, "no approved promotion decision on record for this genome")
@@ -555,7 +599,7 @@ def list_promotion_approvals_endpoint(principal: Principal = Depends(require_rol
                 "genome_hash": r.genome_hash,
                 "experiment_id": r.experiment_id,
                 "approved_by": r.approved_by,
-                "created_at": r.created_at.isoformat(),
+                "created_at": _iso_utc(r.created_at),
             }
             for r in rows
         ]
@@ -605,7 +649,7 @@ def list_canaries_endpoint(principal: Principal = Depends(require_role("viewer")
                 "traffic_split": r.traffic_split,
                 "rollback_triggered": r.rollback_triggered,
                 "result": r.result,
-                "created_at": r.created_at.isoformat(),
+                "created_at": _iso_utc(r.created_at),
             }
             for r in rows
         ]

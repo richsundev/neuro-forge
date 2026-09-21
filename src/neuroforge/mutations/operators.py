@@ -125,7 +125,9 @@ def _model_name(genome: SystemGenome) -> list[MutationProposal]:
 
 def _retrieval_top_k(genome: SystemGenome) -> list[MutationProposal]:
     current = genome.retrieval.top_k
-    candidates = sorted({max(1, current - 2), current + 2, current + 4})
+    # top_k is bounded to [1, 50] by RetrievalConfig; unclamped, current + 4 near the ceiling built an
+    # invalid genome and crashed candidate generation with a ValidationError.
+    candidates = sorted({max(1, current - 2), min(50, current + 2), min(50, current + 4)})
     return [
         MutationProposal(
             "retrieval.top_k",

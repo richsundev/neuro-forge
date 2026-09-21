@@ -10,6 +10,7 @@ const STATUS_BADGE: Record<string, string> = {
   running: "bg-accent/10 text-accent",
   created: "bg-slate-200 text-slate-600",
   queued: "bg-warn/10 text-warn",
+  failed: "bg-bad/10 text-bad",
 };
 
 export default function OverviewPage() {
@@ -37,7 +38,7 @@ export default function OverviewPage() {
 
   return (
     <div className="space-y-6">
-      <ApiKeyBar />
+      <ApiKeyBar onSaved={load} />
       {error && (
         <div className="card border-bad/30 bg-bad/5 text-sm text-bad">
           Could not reach the API ({error}). Set NEXT_PUBLIC_API_URL and a valid X-API-Key above, then

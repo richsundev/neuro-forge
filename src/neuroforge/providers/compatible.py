@@ -12,6 +12,26 @@ from neuroforge.genomes.schema import ModelConfig
 from neuroforge.providers.base import GenerationRequest, GenerationResult, LLMProvider
 
 
+def _post_json(req: urlrequest.Request, provider: str, timeout: float = 60) -> dict:
+    """POST and decode a JSON reply, turning every failure mode into one RuntimeError.
+
+    `URLError` alone missed a read timeout (`TimeoutError` raised from `resp.read()`), a dropped
+    connection mid-body, and a non-JSON reply — each of which escaped as an unrelated exception type
+    instead of the "provider failed" error callers (and the evaluator timeout path) expect."""
+    import json
+
+    if not req.full_url.lower().startswith(("http://", "https://")):
+        # urllib will happily open file:// and custom schemes; a base URL is only ever meant to be HTTP(S).
+        raise RuntimeError(f"{provider} base URL must be http(s), got: {req.full_url[:60]!r}")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - scheme checked above
+            return json.loads(resp.read())
+    except (urlerror.URLError, TimeoutError, ConnectionError) as exc:
+        raise RuntimeError(f"{provider} request failed: {exc}") from exc
+    except ValueError as exc:  # json.JSONDecodeError
+        raise RuntimeError(f"{provider} returned a non-JSON response: {exc}") from exc
+
+
 class OpenAICompatibleProvider(LLMProvider):
     """Talks to any OpenAI-compatible chat-completions endpoint (OpenAI, vLLM, Ollama's OpenAI
     shim, etc). Requires `base_url` and `api_key` — disabled unless both are configured, so CI and
@@ -52,13 +72,12 @@ class OpenAICompatibleProvider(LLMProvider):
             method="POST",
         )
         start = time.monotonic()
-        try:
-            with urlrequest.urlopen(req, timeout=60) as resp:
-                body = json.loads(resp.read())
-        except urlerror.URLError as exc:
-            raise RuntimeError(f"OpenAI-compatible request failed: {exc}") from exc
+        body = _post_json(req, "OpenAI-compatible")
         latency_ms = (time.monotonic() - start) * 1000
-        text = body["choices"][0]["message"]["content"]
+        try:
+            text = body["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"OpenAI-compatible response had no completion: {str(body)[:200]}") from exc
         usage = body.get("usage", {})
         return GenerationResult(
             text=text,
@@ -109,11 +128,7 @@ class AnthropicCompatibleProvider(LLMProvider):
             method="POST",
         )
         start = time.monotonic()
-        try:
-            with urlrequest.urlopen(req, timeout=60) as resp:
-                body = json.loads(resp.read())
-        except urlerror.URLError as exc:
-            raise RuntimeError(f"Anthropic request failed: {exc}") from exc
+        body = _post_json(req, "Anthropic")
         latency_ms = (time.monotonic() - start) * 1000
         text = "".join(block.get("text", "") for block in body.get("content", []))
         usage = body.get("usage", {})
