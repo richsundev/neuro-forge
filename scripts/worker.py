@@ -33,6 +33,11 @@ def run_one(experiment_id: str) -> None:
     except ExperimentAlreadyRunning:
         logger.warning("experiment %s is already running elsewhere, skipping", experiment_id)
         return
+    except Exception:
+        # The runner has recorded the experiment as failed. A bad experiment is not a broken worker or
+        # queue, so it must not go through the loop's back-off (which is for Redis being unreachable).
+        logger.exception("experiment %s failed", experiment_id)
+        return
     logger.info("experiment %s finished: %s (%s)", experiment_id, result.status, result.stop_reason)
 
 

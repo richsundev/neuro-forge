@@ -31,6 +31,10 @@ MIN_HOLDOUT_CHALLENGES = 10
 class HoldoutEvidence(BaseModel):
     dataset_id: str
     dataset_version: int
+    # The genome the candidate was compared with. The comparison, the baseline metrics and every gate
+    # measured against them mean nothing for a different baseline, so a stored measurement is only
+    # reusable for the same one ("" = stored before this was recorded, never reused).
+    baseline_hash: str = ""
     n_holdout: int
     baseline_metrics: dict[str, float]
     candidate_metrics: dict[str, float]
@@ -76,6 +80,7 @@ def evaluate_on_holdout(
     return HoldoutEvidence(
         dataset_id=dataset.dataset_id,
         dataset_version=dataset.version,
+        baseline_hash=baseline.hash(),
         n_holdout=len(challenges),
         baseline_metrics=aggregate(baseline_results, categories).as_dict(),
         candidate_metrics=aggregate(candidate_results, categories).as_dict(),

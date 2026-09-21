@@ -77,26 +77,40 @@ def run_recorded_experiment(experiment_id: str, state_root: Path) -> ExperimentR
         baseline = _baseline_for_run(session, application_id, config)
         dataset = _dataset_for_run(session, application_id, config, experiment_id, state_root)
 
+    def mark_failed() -> None:
+        with session_scope() as session:
+            save_experiment(session, application_id, config, status="failed")
+
     if baseline is None or dataset is None:
+        # `/enqueue` and the worker had already marked it queued; without this it stayed queued forever.
+        mark_failed()
         raise RunnerError("experiment is missing its baseline genome or dataset")
 
-    engine = ExperimentEngine(config, baseline, dataset, state_root / experiment_id)
+    try:
+        engine = ExperimentEngine(config, baseline, dataset, state_root / experiment_id)
+    except Exception:
+        logger.exception("experiment %s could not be set up", experiment_id)
+        mark_failed()
+        raise
     with session_scope() as session:
         save_experiment(session, application_id, config, status="running")
+    cancel_flag = state_root / experiment_id / f"{experiment_id}.cancel"
     try:
         result = engine.run()
     except ExperimentAlreadyRunning:
-        raise
+        raise  # someone else is running it; their cancel flag is theirs
     except DatasetTooSmall as exc:
-        with session_scope() as session:
-            save_experiment(session, application_id, config, status="failed")
+        mark_failed()
         raise RunnerError(str(exc)) from exc
     except Exception:
         # Without this the row stayed "running" (or "created") forever after a crash.
         logger.exception("experiment %s failed", experiment_id)
-        with session_scope() as session:
-            save_experiment(session, application_id, config, status="failed")
+        mark_failed()
         raise
+    finally:
+        # The run is over, so a cancel request still on disk (made while it was finishing, or repeated
+        # after the first was honoured) can only cancel the experiment's *next* run.
+        cancel_flag.unlink(missing_ok=True)
 
     with session_scope() as session:
         save_genome(session, SystemGenome.model_validate(result.best_genome))

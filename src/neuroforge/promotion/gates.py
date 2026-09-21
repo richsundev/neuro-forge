@@ -40,8 +40,11 @@ PROMOTION_ORDER: list[PromotionStatus] = [
 class PromotionGateConfig(BaseModel):
     min_quality: float = Field(default=0.62, ge=0.0, le=1.0)
     min_confidence: float = Field(default=0.95, ge=0.5, le=0.999)
-    max_cost_increase: float = Field(default=0.10, description="fractional, e.g. 0.10 = +10%")
-    max_latency_increase: float = Field(default=0.15, description="fractional, e.g. 0.15 = +15%")
+    # Fractional change vs. the baseline; negative demands a reduction (-0.3 = at least 30% cheaper).
+    # Bounded so NaN (which compares False against everything, disabling the gate) and nonsense such as
+    # "-150%" are refused rather than silently accepted.
+    max_cost_increase: float = Field(default=0.10, ge=-0.99, le=100.0, description="fractional, e.g. 0.10 = +10%")
+    max_latency_increase: float = Field(default=0.15, ge=-0.99, le=100.0, description="fractional, e.g. 0.15 = +15%")
     require_statistically_significant_improvement: bool = True
 
 
@@ -144,7 +147,8 @@ def evaluate_promotion(
 
     # Regression guard: a large single-metric gain paired with a disproportionate loss elsewhere.
     if quality - baseline.metrics.get("quality", 0.0) > 0 and (
-        cost_increase > 2 * gates.max_cost_increase or latency_increase > 2 * gates.max_latency_increase
+        cost_increase > _guard_limit(gates.max_cost_increase)
+        or latency_increase > _guard_limit(gates.max_latency_increase)
     ):
         reasons.append(
             "regression guard: quality gain does not justify the disproportionate cost/latency increase"
@@ -165,6 +169,14 @@ def evaluate_promotion(
         reasons=reasons or ["all promotion gates passed"],
         evidence=evidence,
     )
+
+
+def _guard_limit(gate_limit: float) -> float:
+    """How much cost/latency growth the regression guard tolerates alongside a quality gain: twice the
+    gate's allowance. Doubling a *negative* limit (a required reduction) would make the guard stricter
+    than the gate (-0.3 -> -0.6), so this is `limit + |limit|`: 2x for a positive limit, 0 for a negative
+    one (any increase is already rejected by the gate itself)."""
+    return gate_limit + abs(gate_limit)
 
 
 def _fractional_increase(baseline: float, candidate: float) -> float:

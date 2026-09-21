@@ -12,7 +12,7 @@ import math
 import threading
 import time
 from collections.abc import AsyncIterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated
@@ -57,7 +57,11 @@ from neuroforge.experiments.configure import (
     build_search_space,
     describe_domain,
 )
-from neuroforge.experiments.engine import ExperimentAlreadyRunning, ExperimentConfig
+from neuroforge.experiments.engine import (
+    ExperimentAlreadyRunning,
+    ExperimentConfig,
+    run_lock_is_held,
+)
 from neuroforge.experiments.events import EventLog
 from neuroforge.experiments.queue import enqueue_experiment
 from neuroforge.experiments.runner import RunnerError, UnknownExperiment, run_recorded_experiment
@@ -128,7 +132,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if key:
         logger.warning("Bootstrap admin API key created (store it now, shown only once): %s", key)
     yield
-    _RUN_POOL.shutdown(wait=False, cancel_futures=True)
+    _stop_background_runs()
 
 
 app = FastAPI(title="NeuroForge API", version="1.0.0", description=__doc__, lifespan=_lifespan)
@@ -454,6 +458,10 @@ def _create_experiment(body: ExperimentCreateRequest, principal: Principal) -> d
         if dataset is None:
             dataset = seed_dataset(domain, dataset_id, n=DEFAULT_DATASET_SIZE, seed=body.seed)
             save_dataset_version(session, dataset)
+        elif dataset.challenges and dataset.domain_name != body.domain:
+            raise HTTPException(
+                400, f"dataset '{dataset_id}' belongs to domain '{dataset.domain_name}', not '{body.domain}'"
+            )
 
         try:
             search_space = build_search_space(body.domain, body.search_dimensions)
@@ -509,7 +517,7 @@ def list_experiments_endpoint(principal: Principal = Depends(require_role("viewe
                 "baseline_is_current": _baseline_is_current(session, r, production_cache),
                 "domain": r.domain_name,
                 "strategy": r.search_strategy,
-                "status": r.status,
+                "status": _reported_status(r),
                 "created_at": _iso_utc(r.created_at),
                 "best_genome_hash": _best_genome_hash(r.result),
                 "recommendation": (r.result or {}).get("recommendation"),
@@ -527,7 +535,7 @@ def get_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = 
             raise HTTPException(404, f"unknown experiment '{experiment_id}'")
         return {
             "experiment_id": record.experiment_id,
-            "status": record.status,
+            "status": _reported_status(record),
             "config": record.config,
             "result": record.result,
         }
@@ -551,9 +559,47 @@ def run_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = 
 # an experiment and poll its progress instead of holding a request open. It is for single-process and
 # demo deployments; a production deployment enqueues to the Redis worker instead (`/enqueue`).
 _RUN_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nf-experiment")
+# Experiments this process has accepted and not finished (waiting for a pool thread, or running). Kept in
+# memory rather than as a "queued" row: a restart empties it, and a row left saying "queued" for a run
+# that no longer exists could neither be started again nor cancelled.
 _ACTIVE_RUNS: set[str] = set()
+_SUBMITTED: dict[str, Future] = {}
 _ACTIVE_LOCK = threading.Lock()
 _MAX_ACTIVE_RUNS = 6
+# A "running" row whose run lock nobody holds is a dead run (crash, restart) — but the row is written a
+# moment before the engine takes the lock, so only call it dead once it has been that way a while.
+_STALE_RUN_SECONDS = 15.0
+
+
+def _is_active_here(experiment_id: str) -> bool:
+    with _ACTIVE_LOCK:
+        return experiment_id in _ACTIVE_RUNS
+
+
+def _reported_status(record) -> str:
+    """The status to show for an experiment. Two cases the stored row can't express on its own: this
+    process has accepted a run that hasn't started yet ("queued"), and a "running" row whose run died
+    with its process (recorded as "failed", so it can be started again and resumes from its checkpoint)."""
+    if _is_active_here(record.experiment_id):
+        return record.status if record.status == "running" else "queued"
+    if record.status == "running":
+        age = (datetime.now(UTC) - _as_utc(record.updated_at)).total_seconds()
+        if age > _STALE_RUN_SECONDS and not run_lock_is_held(
+            _state_dir() / record.experiment_id, record.experiment_id
+        ):
+            record.status = "failed"
+            return "failed"
+    return record.status
+
+
+def _as_utc(moment: datetime) -> datetime:
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _request_cancel(experiment_id: str) -> None:
+    flag = _state_dir() / experiment_id / f"{experiment_id}.cancel"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
 
 
 def _run_in_background(experiment_id: str) -> None:
@@ -567,12 +613,47 @@ def _run_in_background(experiment_id: str) -> None:
     finally:
         with _ACTIVE_LOCK:
             _ACTIVE_RUNS.discard(experiment_id)
+            _SUBMITTED.pop(experiment_id, None)
+        # A cancel accepted while the run was finishing arrives after the runner's own cleanup.
+        (_state_dir() / experiment_id / f"{experiment_id}.cancel").unlink(missing_ok=True)
+
+
+_SHUTDOWN_GRACE_SECONDS = 20.0
+
+
+def _stop_background_runs() -> None:
+    """At shutdown, stop this process's experiments cleanly instead of letting the process die under
+    them (uvicorn re-raises SIGTERM once the app has shut down, which kills the run threads outright and
+    leaves each experiment "running" until it is noticed to be dead). Runs still waiting for a thread
+    never start; running ones are asked to stop after their current generation and finish as
+    `cancelled`, resumable from their checkpoint. Any request that wasn't picked up in time is withdrawn
+    so it can't cancel the experiment's next run."""
+    _RUN_POOL.shutdown(wait=False, cancel_futures=True)
+    with _ACTIVE_LOCK:
+        for experiment_id, future in list(_SUBMITTED.items()):
+            if future.cancelled():
+                _ACTIVE_RUNS.discard(experiment_id)
+                del _SUBMITTED[experiment_id]
+        running = list(_ACTIVE_RUNS)
+    for experiment_id in running:
+        _request_cancel(experiment_id)
+    deadline = time.monotonic() + _SHUTDOWN_GRACE_SECONDS
+    while time.monotonic() < deadline and _any_active():
+        time.sleep(0.1)
+    for experiment_id in running:
+        (_state_dir() / experiment_id / f"{experiment_id}.cancel").unlink(missing_ok=True)
+
+
+def _any_active() -> bool:
+    with _ACTIVE_LOCK:
+        return bool(_ACTIVE_RUNS)
 
 
 @app.post("/api/v1/experiments/{experiment_id}/start", tags=["experiments"], status_code=202)
 def start_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = Depends(require_role("operator"))) -> dict:
     """Start an experiment in the background and return immediately; follow it with
-    `GET /experiments/{id}`, `/checkpoint` and `/candidates`."""
+    `GET /experiments/{id}`, `/checkpoint` and `/candidates`. A cancelled, failed or interrupted
+    experiment resumes from its checkpoint."""
     with _ACTIVE_LOCK:
         if experiment_id in _ACTIVE_RUNS:
             raise HTTPException(409, f"experiment '{experiment_id}' is already running")
@@ -584,10 +665,13 @@ def start_experiment_endpoint(experiment_id: ExperimentId, principal: Principal 
             record = get_experiment(session, experiment_id)
             if record is None:
                 raise HTTPException(404, f"unknown experiment '{experiment_id}'")
-            if record.status in ("running", "queued"):
-                raise HTTPException(409, f"experiment '{experiment_id}' is already {record.status}")
-            save_experiment(session, record.application_id, ExperimentConfig.model_validate(record.config), status="queued")
-        _RUN_POOL.submit(_run_in_background, experiment_id)
+            # Only a live run blocks a start. A "running" row nobody holds the lock for died with its
+            # process, and a "queued" one may be a job the Redis queue lost; the run lock keeps two
+            # processes from ever executing the same experiment, so starting again is safe.
+            if record.status == "running" and run_lock_is_held(_state_dir() / experiment_id, experiment_id):
+                raise HTTPException(409, f"experiment '{experiment_id}' is already running")
+        with _ACTIVE_LOCK:
+            _SUBMITTED[experiment_id] = _RUN_POOL.submit(_run_in_background, experiment_id)
     except BaseException:
         with _ACTIVE_LOCK:
             _ACTIVE_RUNS.discard(experiment_id)
@@ -604,11 +688,10 @@ def cancel_experiment_endpoint(experiment_id: ExperimentId, principal: Principal
             raise HTTPException(404, f"unknown experiment '{experiment_id}'")
         # The flag is only consumed by a run that is (or is about to be) executing. Left behind for an
         # idle experiment, it silently cancelled the *next* run and relabelled a finished one.
-        if record.status not in ("running", "queued"):
-            raise HTTPException(409, f"experiment '{experiment_id}' is {record.status}, not running or queued")
-    flag = _state_dir() / experiment_id / f"{experiment_id}.cancel"
-    flag.parent.mkdir(parents=True, exist_ok=True)
-    flag.touch()
+        status = _reported_status(record)
+        if status not in ("running", "queued"):
+            raise HTTPException(409, f"experiment '{experiment_id}' is {status}, not running or queued")
+    _request_cancel(experiment_id)
     audit(principal.name, "cancel_experiment", {"experiment_id": experiment_id})
     return {"cancelled": True}
 

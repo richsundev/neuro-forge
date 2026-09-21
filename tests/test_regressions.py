@@ -631,3 +631,271 @@ def test_failure_driven_evolution_through_the_api(client):
     assert {d["source"] for d in listed} == {"seed", "failure_driven"}
     assert c.post("/api/v1/datasets/d/evolve", json={"failing_categories": ["nope"]}, headers=h).status_code == 400
     assert c.post("/api/v1/datasets/d/evolve", json={"n_new": 5}, headers=h).status_code == 400  # neither mode chosen
+
+
+# --- bug hunt 4: review evidence, run state, validation ----------------------------------------
+
+
+def test_holdout_evidence_is_only_reused_for_the_baseline_it_was_measured_against(client):
+    """The stored holdout measurement was keyed by genome and dataset version alone, so reviewing a
+    genome under an experiment with a different baseline reused a comparison against the *old* one:
+    the champion, reviewed under an experiment that started from itself, was approved at +25%."""
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 60, "seed": 1}, headers=h)
+    for eid, baseline in (("a", "original"), ("b", "champion")):
+        assert c.post("/api/v1/experiments", json={**_experiment(eid, seed=3), "baseline": baseline}, headers=h).status_code == 200
+        assert c.post(f"/api/v1/experiments/{eid}/run", headers=h).status_code == 200
+    best = next(e for e in c.get("/api/v1/experiments", headers=h).json() if e["experiment_id"] == "a")["best_genome_hash"]
+
+    first = c.post("/api/v1/promotions", json={"genome_hash": best, "experiment_id": "a"}, headers=h).json()
+    assert "LIKELY_IMPROVEMENT" in first["evidence"][1]
+
+    from neuroforge.db.repository import get_experiment
+    from neuroforge.db.session import session_scope
+
+    with session_scope() as session:  # experiment b, re-based on the genome under review itself
+        record = get_experiment(session, "b")
+        result = dict(record.result)
+        result["baseline_genome"] = c.get(f"/api/v1/genomes/{best}", headers=h).json()
+        record.result = result
+    again = c.post("/api/v1/promotions", json={"genome_hash": best, "experiment_id": "b"}, headers=h).json()
+    assert not again["approved"] and "INCONCLUSIVE" in again["evidence"][1]
+    same = c.post("/api/v1/promotions", json={"genome_hash": best, "experiment_id": "a"}, headers=h).json()
+    assert same["evidence"][1] == first["evidence"][1]  # the original baseline still reuses its stored measurement
+
+
+def test_a_genome_of_another_application_cannot_be_reviewed_under_an_experiment(client):
+    c, h = client
+    for app in ("app", "other"):
+        c.post("/api/v1/applications", json={"id": app, "name": app, "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 60, "seed": 1}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "other-dataset", "n": 60, "seed": 1}, headers=h)
+    c.post("/api/v1/experiments", json=_experiment("e1"), headers=h)
+    c.post("/api/v1/experiments/e1/run", headers=h)
+    c.post("/api/v1/experiments", json={**_experiment("e2"), "system_id": "other"}, headers=h)
+    c.post("/api/v1/experiments/e2/run", headers=h)
+    foreign = next(e for e in c.get("/api/v1/experiments", headers=h).json() if e["experiment_id"] == "e2")["best_genome_hash"]
+    assert c.post("/api/v1/promotions", json={"genome_hash": foreign, "experiment_id": "e1"}, headers=h).status_code == 400
+
+
+def test_gate_limits_reject_nan_and_nonsense():
+    """NaN compares False against everything, so a NaN cost limit silently disabled the gate."""
+    from pydantic import ValidationError
+
+    for bad in (float("nan"), -5.0, 1e6):
+        with pytest.raises(ValidationError):
+            PromotionGateConfig(max_cost_increase=bad)
+    assert PromotionGateConfig(max_cost_increase=-0.3).max_cost_increase == -0.3  # "at least 30% cheaper"
+
+
+def test_the_regression_guard_is_not_stricter_than_the_gate_it_backs_up():
+    """Doubling a negative limit (a required cost reduction) made the guard demand twice the reduction."""
+    from neuroforge.evaluation.aggregate import AggregateMetrics
+    from neuroforge.evaluation.statistics import ComparisonResult
+
+    def agg(cost):
+        return AggregateMetrics(genome_hash="x", n_evaluations=50, metrics={"quality": 0.7}, cost_usd=cost, latency_ms=100.0)
+
+    better = ComparisonResult(0.1, 0.2, 0.1, 0.3, 1.0, 0.95, Conclusion.LIKELY_IMPROVEMENT)
+    gates = PromotionGateConfig(max_cost_increase=-0.3, max_latency_increase=1.0)
+    decision = evaluate_promotion(AggregateMetrics(genome_hash="b", n_evaluations=50, metrics={"quality": 0.5}, cost_usd=1.0, latency_ms=100.0), agg(0.6), better, gates, SafetyConstraints())
+    assert decision.approved, decision.reasons  # 40% cheaper clears a 30% required reduction
+
+
+def test_non_finite_objective_weights_are_a_config_error_not_a_crash():
+    from neuroforge.experiments.configure import ConfigError, build_objectives
+
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ConfigError):
+            build_objectives({"quality": bad})
+
+
+def test_a_failed_setup_marks_the_experiment_failed_instead_of_leaving_it_queued(client):
+    """`/enqueue` and the worker mark an experiment queued first; a run that couldn't even start
+    (no dataset) raised without touching the row, which then said "queued" forever."""
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 40, "seed": 1}, headers=h)
+    c.post("/api/v1/experiments", json=_experiment(), headers=h)
+
+    from neuroforge.db.models import DatasetVersionRecord
+    from neuroforge.db.repository import get_experiment, save_experiment
+    from neuroforge.db.session import session_scope
+    from neuroforge.experiments.runner import RunnerError, run_recorded_experiment
+
+    with session_scope() as session:
+        record = get_experiment(session, "e1")
+        save_experiment(session, record.application_id, ExperimentConfig.model_validate(record.config), status="queued")
+        for row in session.query(DatasetVersionRecord).all():
+            session.delete(row)
+    from neuroforge_api.main import _state_dir
+
+    with pytest.raises(RunnerError):
+        run_recorded_experiment("e1", _state_dir())
+    assert c.get("/api/v1/experiments/e1", headers=h).json()["status"] == "failed"
+
+
+def test_a_cancelled_run_can_be_started_again_and_resumes(client):
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 60, "seed": 1}, headers=h)
+    c.post("/api/v1/experiments", json=_experiment(), headers=h)
+    from neuroforge_api.main import _state_dir
+
+    flag = _state_dir() / "e1" / "e1.cancel"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()
+    assert c.post("/api/v1/experiments/e1/run", headers=h).status_code == 200
+    assert c.get("/api/v1/experiments/e1", headers=h).json()["status"] == "cancelled"
+    assert c.post("/api/v1/experiments/e1/start", headers=h).status_code == 202
+    for _ in range(150):
+        if c.get("/api/v1/experiments/e1", headers=h).json()["status"] == "completed":
+            break
+        import time
+
+        time.sleep(0.2)
+    assert c.get("/api/v1/experiments/e1", headers=h).json()["status"] == "completed"
+
+
+def test_a_run_that_died_with_its_process_is_reported_failed_and_can_be_started_again(client):
+    """An API restart (or a crashed worker) left the row "running"/"queued" for a run that no longer
+    existed: it showed a live progress bar forever and offered nothing but a cancel that nobody read."""
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 60, "seed": 1}, headers=h)
+    c.post("/api/v1/experiments", json=_experiment(), headers=h)
+
+    import datetime as dt
+
+    from neuroforge.db.repository import get_experiment
+    from neuroforge.db.session import session_scope
+
+    with session_scope() as session:
+        record = get_experiment(session, "e1")
+        record.status = "running"
+        record.updated_at = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=5)
+    assert c.get("/api/v1/experiments/e1", headers=h).json()["status"] == "failed"
+    assert next(e for e in c.get("/api/v1/experiments", headers=h).json())["status"] == "failed"
+    assert c.post("/api/v1/experiments/e1/start", headers=h).status_code == 202
+
+
+def test_a_cancel_that_arrives_as_the_run_converges_does_not_cancel_the_next_run(baseline_genome, small_dataset, tmp_path):
+    """Convergence ends the run without another pass through the top-of-loop cancel check, so a cancel
+    requested during that last batch stayed on disk and cancelled the experiment's next run at once."""
+    loose = {
+        "promotion_gates": PromotionGateConfig(min_quality=0.0, max_cost_increase=100, max_latency_increase=100),
+        "safety_constraints": SafetyConstraints(min_safety_score=0.0, max_policy_violation_rate=1.0),
+        "search_space": search_space_for_domain("forge-support").model_copy(
+            update={"parameters": {"retrieval.top_k": search_space_for_domain("forge-support").parameters["retrieval.top_k"]}}
+        ),
+        "batch_size": 4,
+    }
+    engine = ExperimentEngine(_config("random", 400, **loose), baseline_genome, small_dataset, tmp_path)
+    flag = tmp_path / "x.cancel"
+    evaluated = 0
+    original = engine._evaluate_candidate
+
+    def evaluate(genome, challenges):
+        nonlocal evaluated
+        evaluated += 1
+        out = original(genome, challenges)
+        if evaluated == 16:  # the last candidate of the 4th batch — where a plateau ends this run
+            flag.touch()
+        return out
+
+    engine._evaluate_candidate = evaluate  # type: ignore[method-assign]
+    result = engine.run()
+    assert result.stop_reason.startswith("fitness plateau") and result.status == "completed"
+    assert not flag.exists()
+
+
+def test_experiment_creation_refuses_a_dataset_from_another_domain(client):
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "sqlapp", "name": "s", "domain": "sql-agent"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "shared", "n": 40, "seed": 1, "domain": "forge-support"}, headers=h)
+    body = {**_experiment("e1"), "system_id": "sqlapp", "domain": "sql-agent", "dataset_id": "shared"}
+    r = c.post("/api/v1/experiments", json=body, headers=h)
+    assert r.status_code == 400 and "belongs to domain" in r.json()["detail"]
+
+
+def test_candidate_version_clash_is_detected_when_a_budget_grows_into_a_later_experiment(client):
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 40, "seed": 1}, headers=h)
+    for eid in ("e1", "e2"):
+        c.post("/api/v1/experiments", json=_experiment(eid), headers=h)
+
+    from neuroforge.db.repository import candidate_version_clash
+    from neuroforge.db.session import session_scope
+
+    with session_scope() as session:
+        assert candidate_version_clash(session, "e1", "app", 2, 8) is None  # its own reservation
+        assert candidate_version_clash(session, "e1", "app", 2, 100) == "e2"
+        assert candidate_version_clash(session, "e2", "app", 10, 100) is None
+
+
+def test_a_resumed_run_reports_itself_as_running_not_as_the_previous_run_ended(baseline_genome, small_dataset, tmp_path):
+    """The checkpoint kept the previous run's status ("cancelled"/"completed") until the new run
+    finished, so the live-progress endpoint called a running experiment finished."""
+    (tmp_path / "x.cancel").touch()
+    ExperimentEngine(_config("random", 8), baseline_genome, small_dataset, tmp_path).run()
+    checkpoint_path = tmp_path / "x.checkpoint.json"
+    assert ExperimentCheckpoint.load(checkpoint_path).status == "cancelled"
+
+    engine = ExperimentEngine(_config("random", 24), baseline_genome, small_dataset, tmp_path)
+    seen: list[str] = []
+    original = engine._evaluate_candidate
+
+    def evaluate(genome, challenges):
+        seen.append(ExperimentCheckpoint.load(checkpoint_path).status)
+        return original(genome, challenges)
+
+    engine._evaluate_candidate = evaluate  # type: ignore[method-assign]
+    engine.run()
+    assert seen and set(seen) == {"running"}
+
+
+def test_shutting_the_api_down_stops_running_experiments_cleanly(client):
+    """uvicorn re-raises SIGTERM once the app has shut down, killing the run threads: the experiment
+    stayed "running" and the cancel flag set for it was left on disk to cancel its next run."""
+    import sys
+    import time
+
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 60, "seed": 1}, headers=h)
+    body = {**_experiment("e1"), "max_batches": 500, "budget": {**BUDGET, "max_candidates": 4000}, "promotion_gates": {"min_quality": 1.0}}
+    assert c.post("/api/v1/experiments", json=body, headers=h).status_code == 200
+    assert c.post("/api/v1/experiments/e1/start", headers=h).status_code == 202
+    for _ in range(100):
+        if c.get("/api/v1/experiments/e1/checkpoint", headers=h).status_code == 200:
+            break
+        time.sleep(0.1)
+    api_main = sys.modules["neuroforge_api.main"]
+    api_main._stop_background_runs()
+    assert not api_main._ACTIVE_RUNS
+    assert c.get("/api/v1/experiments/e1", headers=h).json()["status"] == "cancelled"
+    assert not (api_main._state_dir() / "e1" / "e1.cancel").exists()
+
+
+def test_a_cancel_requested_while_a_run_finishes_does_not_linger(client, monkeypatch):
+    """Repeated or late cancels left the flag on disk after the run ended, so the experiment's next run
+    was cancelled the moment it started."""
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 40, "seed": 1}, headers=h)
+    c.post("/api/v1/experiments", json=_experiment(), headers=h)
+    from neuroforge_api.main import _state_dir
+
+    flag = _state_dir() / "e1" / "e1.cancel"
+    original = ExperimentEngine._finalize
+
+    def finalize_then_late_cancel(self, *a, **kw):
+        result = original(self, *a, **kw)
+        flag.touch()  # a cancel that arrives as the run is wrapping up
+        return result
+
+    monkeypatch.setattr(ExperimentEngine, "_finalize", finalize_then_late_cancel)
+    assert c.post("/api/v1/experiments/e1/run", headers=h).status_code == 200
+    assert not flag.exists()

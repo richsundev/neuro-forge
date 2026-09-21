@@ -100,13 +100,17 @@ export default function ExperimentDetailPage() {
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let loaded = false;
+    let wasActive = false;
 
     async function load() {
       try {
         const d = await apiGet<ExperimentDetail>(`/api/v1/experiments/${params.id}`);
         if (cancelled) return;
         setDetail(d);
+        loaded = true;
         const running = ACTIVE.has(d.status);
+        wasActive = running;
         try {
           setProgress(await apiGet<ExperimentProgress>(`/api/v1/experiments/${params.id}/checkpoint`));
         } catch {
@@ -122,7 +126,10 @@ export default function ExperimentDetailPage() {
         }
         if (running && !cancelled) timer = setTimeout(load, 1000);
       } catch (err) {
-        if (!cancelled) setError((err as Error).message);
+        if (cancelled) return;
+        // A dropped request mid-run shouldn't replace a live page with an error and stop the updates.
+        if (loaded && wasActive) timer = setTimeout(load, 3000);
+        else setError((err as Error).message);
       }
     }
 
@@ -161,9 +168,9 @@ export default function ExperimentDetailPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {detail.status === "created" && (
+          {(detail.status === "created" || detail.status === "failed" || detail.status === "cancelled") && (
             <button onClick={() => act(`/api/v1/experiments/${params.id}/start`)} className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-white hover:opacity-90">
-              Start
+              {detail.status === "created" ? "Start" : "Resume"}
             </button>
           )}
           {active && (
@@ -187,9 +194,9 @@ export default function ExperimentDetailPage() {
       {!result && !active ? (
         <div className="card text-sm text-slate-500">
           {detail.status === "failed"
-            ? "This run failed — see the API logs. Fix the cause and start it again to resume."
+            ? "This run failed or was interrupted — see the API logs. Resume continues from its last checkpoint."
             : detail.status === "cancelled"
-              ? "Cancelled before finishing. Start it again to resume from its checkpoint."
+              ? "Cancelled before finishing. Resume continues from its last checkpoint."
               : "Not started yet."}
         </div>
       ) : !result ? null : (

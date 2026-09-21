@@ -38,7 +38,12 @@ proportions. Cost and latency are scored relative to the baseline (the baseline 
 cost approaches 0.75), so a weight means the same thing whatever the absolute prices are. The CLI
 takes `--focus`, `--weight` and the gate options; `GET /domains` lists the dimensions a domain has.
 `POST /experiments/{id}/start` runs one in the background (202) and `GET /experiments/{id}/checkpoint`
-reports live progress; production deployments use `/enqueue` instead. Rationale: ADR-0016.
+reports live progress; production deployments use `/enqueue` instead. A cancelled or failed experiment is
+started again the same way and resumes from its checkpoint. Runs live in the API process: the accepted-but-
+not-yet-running state is held in memory (an experiment shows as `queued` while it waits for a pool
+thread), and a `running` row whose run lock nobody holds — the process died — is reported as `failed`
+after 15 seconds. On shutdown the API asks its runs to stop after their current generation (they finish as
+`cancelled`) and clears any request they didn't pick up. Rationale: ADR-0016.
 
 ## Which baseline
 

@@ -157,6 +157,23 @@ def next_candidate_version(session: Session, application_id: str) -> int:
     return start
 
 
+def candidate_version_clash(
+    session: Session, experiment_id: str, application_id: str, first_version: int, n_candidates: int
+) -> str | None:
+    """The id of another experiment of this application whose reserved candidate version numbers fall
+    inside `first_version .. first_version + n_candidates - 1`, if any. Growing an experiment's budget
+    after later experiments were created would otherwise number its new candidates into their range —
+    two different genomes both labelled, say, v202."""
+    stmt = select(ExperimentRecord).where(
+        ExperimentRecord.application_id == application_id, ExperimentRecord.experiment_id != experiment_id
+    )
+    for other in session.scalars(stmt):
+        other_first = (other.config or {}).get("first_candidate_version")
+        if other_first and first_version <= other_first < first_version + n_candidates:
+            return other.experiment_id
+    return None
+
+
 def get_experiment(session: Session, experiment_id: str) -> ExperimentRecord | None:
     return session.get(ExperimentRecord, experiment_id)
 

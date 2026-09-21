@@ -2,7 +2,7 @@
 `neuroforge promotion request`.
 
 A review takes a candidate genome and an experiment, measures the candidate against the experiment
-baseline on the dataset's holdout split (once — later requests reuse the stored measurement),
+baseline on the dataset's holdout split (once per baseline — a repeat request reuses the stored measurement),
 applies the promotion gates and safety constraints *from the experiment's own config* to that
 fresh evidence, and records the decision with the evidence that produced it.
 
@@ -65,11 +65,21 @@ def review_promotion(session: Session, experiment_id: str, genome_hash: str) -> 
     candidate = get_genome(session, genome_hash)
     if candidate is None:
         raise ReviewError(f"unknown genome '{genome_hash}'")
+    if candidate.system_id != record.application_id:
+        raise ReviewError(
+            f"genome '{genome_hash}' belongs to application '{candidate.system_id}', but experiment "
+            f"'{experiment_id}' belongs to '{record.application_id}'"
+        )
     baseline = SystemGenome.model_validate(result["baseline_genome"])
 
     stored = get_holdout_evaluation(session, genome_hash, dataset.dataset_id, dataset.version)
-    if stored is not None:
-        evidence = HoldoutEvidence.model_validate(stored.evidence)
+    reusable = (
+        HoldoutEvidence.model_validate(stored.evidence)
+        if stored is not None and stored.evidence.get("baseline_hash") == baseline.hash()
+        else None
+    )
+    if reusable is not None:
+        evidence = reusable
     else:
         try:
             evidence = evaluate_on_holdout(
@@ -84,19 +94,23 @@ def review_promotion(session: Session, experiment_id: str, genome_hash: str) -> 
             )
         except ValueError as exc:
             raise ReviewError(str(exc)) from exc
-        try:
-            # Savepoint: two simultaneous requests for one candidate both miss the lookup above and
-            # both try to insert; the unique constraint makes the loser fail, and it should simply
-            # use the winner's measurement (the whole point is that there is only one).
-            with session.begin_nested():
-                save_holdout_evaluation(session, genome_hash, experiment_id, evidence)
-        except IntegrityError:
-            winner = get_holdout_evaluation(session, genome_hash, dataset.dataset_id, dataset.version)
-            if winner is None:
-                raise
-            evidence = HoldoutEvidence.model_validate(winner.evidence)
-            stored = winner
+        # One stored measurement per genome and dataset version. If it was made against a different
+        # baseline it is left alone: this comparison decides this review but isn't stored over it.
+        if stored is None:
+            try:
+                # Savepoint: two simultaneous requests for one candidate both miss the lookup above and
+                # both try to insert; the unique constraint makes the loser fail, and it should simply
+                # use the winner's measurement (the whole point is that there is only one).
+                with session.begin_nested():
+                    save_holdout_evaluation(session, genome_hash, experiment_id, evidence)
+            except IntegrityError:
+                winner = get_holdout_evaluation(session, genome_hash, dataset.dataset_id, dataset.version)
+                if winner is None:
+                    raise
+                if winner.evidence.get("baseline_hash") == baseline.hash():
+                    evidence = HoldoutEvidence.model_validate(winner.evidence)
+                    reusable = evidence
 
     decision = decide_from_evidence(evidence, genome_hash, config.promotion_gates, config.safety_constraints)
     save_promotion_decision(session, genome_hash, experiment_id, decision)
-    return PromotionReview(decision=decision, evidence=evidence, holdout_reused=stored is not None)
+    return PromotionReview(decision=decision, evidence=evidence, holdout_reused=reusable is not None)

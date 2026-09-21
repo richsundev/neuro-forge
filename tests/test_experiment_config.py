@@ -204,3 +204,35 @@ def test_cli_experiment_create_takes_focus_weights_and_gate_options(tmp_path):
     assert bad.returncode != 0 and "unknown search dimension" in (bad.stdout + bad.stderr)
     bad = _cli(tmp_path, "experiment", "create", "cli-bad2", "--weight", "quality=lots")
     assert bad.returncode != 0
+
+
+def test_cli_rejects_invalid_options_with_a_message_not_a_traceback(tmp_path):
+    for args, needle in (
+        (["--min-quality", "2"], "min_quality"),
+        (["--max-cost-increase", "nan"], "max_cost_increase"),
+        (["--max-policy-violation", "5"], "max_policy_violation_rate"),
+        (["--weight", "quality=nan"], "finite"),
+        (["--batch-size", "0"], "batch-size"),
+        (["--max-candidates", "0"], "max-candidates"),
+    ):
+        out = _cli(tmp_path, "experiment", "create", "bad", *args)
+        assert out.returncode != 0 and needle in (out.stdout + out.stderr), args
+        assert "Traceback" not in out.stderr, args
+
+
+def test_cli_refuses_a_domain_or_dataset_that_does_not_match(tmp_path):
+    assert _cli(tmp_path, "experiment", "create", "e1").returncode == 0
+    wrong_domain = _cli(tmp_path, "experiment", "create", "e2", "--domain", "sql-agent")
+    assert wrong_domain.returncode != 0 and "uses domain" in " ".join((wrong_domain.stdout + wrong_domain.stderr).split())
+    wrong_dataset = _cli(
+        tmp_path, "experiment", "create", "e3", "--domain", "sql-agent", "--system-id", "sql", "--dataset-id", "support-agent-dataset"
+    )
+    assert wrong_dataset.returncode != 0 and "belongs to domain" in " ".join((wrong_dataset.stdout + wrong_dataset.stderr).split())
+
+
+def test_cli_resume_refuses_to_grow_a_budget_into_another_experiments_versions(tmp_path):
+    for eid in ("e1", "e2"):
+        assert _cli(tmp_path, "experiment", "create", eid, "--max-candidates", "8", "--batch-size", "4").returncode == 0
+    out = _cli(tmp_path, "experiment", "resume", "e1", "--extra-candidates", "100")
+    assert out.returncode != 0 and "would reuse version" in " ".join((out.stdout + out.stderr).split())
+    assert _cli(tmp_path, "experiment", "resume", "e1", "--extra-candidates", "0").returncode != 0

@@ -8,6 +8,7 @@ carries). The API, the CLI and the dashboard all go through here so they validat
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from neuroforge.evaluation.objectives import DEFAULT_OBJECTIVES, Objective, ObjectiveSpec
@@ -66,6 +67,8 @@ def build_objectives(weights: dict[str, float] | None) -> ObjectiveSpec:
     unknown = sorted(set(weights) - set(defaults))
     if unknown:
         raise ConfigError(f"unknown objective(s) {unknown}; known: {sorted(defaults)}")
+    if any(not math.isfinite(w) for w in weights.values()):
+        raise ConfigError("objective weights must be finite numbers")
     if any(w < 0 for w in weights.values()):
         raise ConfigError("objective weights must be >= 0")
     pinned_total = sum(weights.values())

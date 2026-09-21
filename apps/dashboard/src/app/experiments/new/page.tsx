@@ -49,6 +49,9 @@ export default function NewExperimentPage() {
   const [gates, setGates] = useState<{ maxCost: number; maxLatency: number; minQuality: number; maxViolation: number } | null>(null);
   const [busy, setBusy] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  // What an earlier attempt already created: a retry after a failed step must not repeat it (creating the
+  // same experiment again is a 409 that would leave the form stuck).
+  const [created, setCreated] = useState<{ app: string | null; experiment: string | null }>({ app: null, experiment: null });
 
   useEffect(() => {
     Promise.all([
@@ -61,7 +64,11 @@ export default function NewExperimentPage() {
         setDomains(d);
         setExperiments(e);
         setAppChoice(a.length > 0 ? a[0].id : NEW_APP);
-        setExperimentId(`exp-${e.length + 1}`);
+        // The first unused "exp-N": counting existing experiments collides once any were named by hand.
+        const taken = new Set(e.map((x) => x.experiment_id));
+        let n = e.length + 1;
+        while (taken.has(`exp-${n}`)) n += 1;
+        setExperimentId(`exp-${n}`);
       })
       .catch((err) => setLoadError((err as Error).message));
   }, []);
@@ -93,8 +100,9 @@ export default function NewExperimentPage() {
     setSubmitError(null);
     try {
       const systemId = selectedApp ? selectedApp.id : newAppId.trim();
-      if (!selectedApp) {
+      if (!selectedApp && created.app !== systemId) {
         await apiPost("/api/v1/applications", { id: systemId, name: systemId, domain: newAppDomain });
+        setCreated((c) => ({ ...c, app: systemId }));
       }
       const body: Record<string, unknown> = {
         experiment_id: experimentId.trim(),
@@ -116,7 +124,10 @@ export default function NewExperimentPage() {
       if (chosenSections.length < allSections.length) body.search_dimensions = chosenSections;
       const weights = PRIORITIES.find((p) => p.value === priority)?.weights;
       if (weights) body.objective_weights = weights;
-      await apiPost("/api/v1/experiments", body);
+      if (created.experiment !== body.experiment_id) {
+        await apiPost("/api/v1/experiments", body);
+        setCreated((c) => ({ ...c, experiment: String(body.experiment_id) }));
+      }
       await apiPost(`/api/v1/experiments/${body.experiment_id}/start`, {});
       router.push(`/experiments/${body.experiment_id}`);
     } catch (err) {

@@ -70,9 +70,14 @@ review_promotion`, which is the only place a promotion decision is made:
    the split neither the search (train) nor the experiment's own recommendation (validation) ever
    used — through `HoldoutGuard.evaluate_holdout`. The dataset is the one the experiment actually
    ran against (`ExperimentResult.dataset_id` / `dataset_version`).
-2. That measurement is **persisted once** per (genome, dataset version) in `holdout_evaluations`.
-   A repeat request reuses it rather than re-measuring, so the holdout can't be re-rolled to chase a
-   better number (ADR-0007, ADR-0014).
+2. That measurement is **persisted once** per (genome, dataset version) in `holdout_evaluations`, with
+   the baseline it was made against (`baseline_hash`). A repeat request against the same baseline
+   reuses it rather than re-measuring, so the holdout can't be re-rolled to chase a better number
+   (ADR-0007, ADR-0014). A request against a *different* baseline (a genome reviewed under an experiment
+   that started from another champion) is a different comparison: it is measured afresh for that
+   decision and the stored measurement is left as it was. Reusing the old one made the champion,
+   reviewed under an experiment that started from itself, look like a +25% improvement. A genome can
+   only be reviewed under an experiment of its own application.
 3. The gates and safety limits **from the experiment's own config** are applied to it, and the
    decision is stored with the evidence that produced it (`promotion_decisions.evidence`).
 

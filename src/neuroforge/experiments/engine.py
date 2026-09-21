@@ -64,6 +64,24 @@ class DatasetTooSmall(ValueError):
     """The dataset's splits can't support a search plus a validation comparison."""
 
 
+def run_lock_is_held(state_dir: Path, experiment_id: str) -> bool:
+    """Whether some process is running this experiment right now: the engine holds an exclusive advisory
+    lock for the whole run, which the OS drops if that process dies. `state_dir` is the experiment's own
+    directory (`<state root>/<experiment id>`)."""
+    if fcntl is None:  # pragma: no cover
+        return False
+    lock_path = state_dir / f"{experiment_id}.lock"
+    if not lock_path.exists():
+        return False
+    with lock_path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(handle, fcntl.LOCK_UN)
+    return False
+
+
 class ExperimentConfig(BaseModel):
     experiment_id: str
     domain_name: str
@@ -203,6 +221,12 @@ class ExperimentEngine:
                 )
             )
         assert ckpt is not None
+        if resuming and ckpt.status != "running":
+            # A resumed run is running again: leaving the previous run's "cancelled"/"completed" (and its
+            # stop reason) in place made the live-progress endpoint report a running experiment as finished.
+            ckpt.status = "running"
+            ckpt.stop_reason = ""
+            ckpt.save(self.checkpoint_path)
         if resuming and ckpt.dataset_version and ckpt.dataset_version != self.dataset_version.version:
             raise DatasetChanged(
                 f"experiment '{self.config.experiment_id}' was started on dataset "
@@ -416,6 +440,10 @@ class ExperimentEngine:
             if convergence.converged and best_feasible:
                 stop_reason = convergence.reason
                 break
+
+        if stop_reason != "cancelled by user":
+            # A cancel that arrived after the last check would otherwise sit there and cancel the next run.
+            cancel_flag.unlink(missing_ok=True)
 
         # A user-cancelled run is a partial result, not a finished one; reporting it as "completed"
         # put it in the Promotion page's candidate list as if its search had run to its budget.

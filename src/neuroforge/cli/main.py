@@ -9,13 +9,16 @@ import os
 from typing import Annotated
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
 from neuroforge.cli.paths import state_dir
 from neuroforge.datasets.dataset import DatasetVersion
 from neuroforge.datasets.evolution import evolve_from_failures, evolve_if_saturated, seed_dataset
+from neuroforge.db.models import ApplicationRecord
 from neuroforge.db.repository import (
+    candidate_version_clash,
     genome_from_record,
     get_experiment,
     get_genome,
@@ -40,7 +43,11 @@ from neuroforge.experiments.configure import (
     build_search_space,
     parse_weight_options,
 )
-from neuroforge.experiments.engine import ExperimentAlreadyRunning, ExperimentConfig
+from neuroforge.experiments.engine import (
+    ExperimentAlreadyRunning,
+    ExperimentConfig,
+    run_lock_is_held,
+)
 from neuroforge.experiments.runner import RunnerError, UnknownExperiment, run_recorded_experiment
 from neuroforge.genomes.schema import PromotionStatus, SystemGenome
 from neuroforge.optimization import STRATEGY_REGISTRY
@@ -229,9 +236,9 @@ def experiment_create(
     dataset_id: str | None = None,
     strategy: str = "evolutionary",
     seed: int = 42,
-    batch_size: int = 16,
-    max_batches: int = 20,
-    max_candidates: int = 200,
+    batch_size: Annotated[int, typer.Option(min=1, max=500)] = 16,
+    max_batches: Annotated[int, typer.Option(min=1, max=1000)] = 20,
+    max_candidates: Annotated[int, typer.Option(min=1)] = 200,
     baseline: str = typer.Option(
         "champion",
         help='what to evolve from: "champion" (current production genome, else the original), '
@@ -257,6 +264,9 @@ def experiment_create(
     with session_scope() as session:
         if get_experiment(session, experiment_id) is not None:
             raise typer.BadParameter(f"experiment '{experiment_id}' already exists")
+        existing_app = session.get(ApplicationRecord, system_id)
+        if existing_app is not None and existing_app.domain_name != domain:
+            raise typer.BadParameter(f"application '{system_id}' uses domain '{existing_app.domain_name}', not '{domain}'")
         upsert_application(session, system_id, system_id, domain)
         if get_genome_by_system_version(session, system_id, 1) is None:
             save_genome(session, SystemGenome(system_id=system_id, version=1))
@@ -271,6 +281,8 @@ def experiment_create(
         if dataset is None:
             dataset = seed_dataset(d, dataset_id, n=300, seed=seed)
             save_dataset_version(session, dataset)
+        elif dataset.challenges and dataset.domain_name != domain:
+            raise typer.BadParameter(f"dataset '{dataset_id}' belongs to domain '{dataset.domain_name}', not '{domain}'")
 
         from neuroforge.experiments.budget import ExperimentBudget
 
@@ -289,26 +301,29 @@ def experiment_create(
             if v is not None
         }
         extra: dict = {}
-        if gate_overrides:
-            extra["promotion_gates"] = PromotionGateConfig(**gate_overrides)
-        if max_policy_violation is not None:
-            extra["safety_constraints"] = SafetyConstraints(max_policy_violation_rate=max_policy_violation)
-
-        config = ExperimentConfig(
-            experiment_id=experiment_id,
-            domain_name=domain,
-            dataset_id=dataset_id,
-            baseline_hash=baseline_record.hash,
-            first_candidate_version=next_candidate_version(session, system_id),
-            search_strategy=strategy,
-            search_space=search_space,
-            objectives=objectives,
-            **extra,
-            batch_size=batch_size,
-            max_batches=max_batches,
-            seed=seed,
-            budget=ExperimentBudget(max_candidates=max_candidates, max_requests=1_000_000, max_cost_usd=100, max_duration_minutes=60),
-        )
+        try:
+            if gate_overrides:
+                extra["promotion_gates"] = PromotionGateConfig(**gate_overrides)
+            if max_policy_violation is not None:
+                extra["safety_constraints"] = SafetyConstraints(max_policy_violation_rate=max_policy_violation)
+            config = ExperimentConfig(
+                experiment_id=experiment_id,
+                domain_name=domain,
+                dataset_id=dataset_id,
+                baseline_hash=baseline_record.hash,
+                first_candidate_version=next_candidate_version(session, system_id),
+                search_strategy=strategy,
+                search_space=search_space,
+                objectives=objectives,
+                **extra,
+                batch_size=batch_size,
+                max_batches=max_batches,
+                seed=seed,
+                budget=ExperimentBudget(max_candidates=max_candidates, max_requests=1_000_000, max_cost_usd=100, max_duration_minutes=60),
+            )
+        except ValidationError as exc:
+            problems = "; ".join(f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())
+            raise typer.BadParameter(problems) from exc
         save_experiment(session, system_id, config, status="created")
     console.print(
         f"[green]created experiment[/] {experiment_id} (system={system_id}, dataset={dataset_id}, "
@@ -355,7 +370,9 @@ def experiment_status(experiment_id: str) -> None:
 
 
 @experiment_cmd.command("resume")
-def experiment_resume(experiment_id: str, extra_candidates: int = 100) -> None:
+def experiment_resume(experiment_id: str, extra_candidates: Annotated[int, typer.Option(min=1)] = 100) -> None:
+    if run_lock_is_held(state_dir() / experiment_id, experiment_id):
+        raise typer.BadParameter(f"experiment '{experiment_id}' is already running")
     with session_scope() as session:
         record = get_experiment(session, experiment_id)
         if record is None:
@@ -366,6 +383,19 @@ def experiment_resume(experiment_id: str, extra_candidates: int = 100) -> None:
     ckpt = ExperimentCheckpoint.load_or_none(ckpt_path)
     already = ckpt.candidates_completed() if ckpt else 0
     config.budget.max_candidates = already + extra_candidates
+    # A run that stopped on max_batches would otherwise stop again at once, however many candidates were added.
+    generations = ckpt.generations_completed() if ckpt else 0
+    config.max_batches = max(config.max_batches, generations + -(-extra_candidates // config.batch_size))
+    if config.first_candidate_version:
+        with session_scope() as session:
+            clash = candidate_version_clash(
+                session, experiment_id, record.application_id, config.first_candidate_version, config.budget.max_candidates
+            )
+        if clash:
+            raise typer.BadParameter(
+                f"raising '{experiment_id}' to {config.budget.max_candidates} candidates would reuse version "
+                f"numbers already assigned to experiment '{clash}' — create a new experiment instead"
+            )
     with session_scope() as session:
         save_experiment(session, record.application_id, config, status="running")
     experiment_run(experiment_id)
