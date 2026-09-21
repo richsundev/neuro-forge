@@ -15,7 +15,7 @@ class ApplicationCreate(BaseModel):
 class DatasetSeedRequest(BaseModel):
     dataset_id: str
     domain: str = "forge-support"
-    n: int = 100
+    n: int = 300
     seed: int = 1
 
 
@@ -54,6 +54,8 @@ class CanaryRequest(BaseModel):
     dataset_id: str
     traffic_fraction: float = 0.10
     n_requests: int = 200
+    # Defaults to a seed derived from the candidate hash, so a canary is deterministic per candidate.
+    traffic_seed: int | None = None
 
 
 class ApiKeyCreateRequest(BaseModel):

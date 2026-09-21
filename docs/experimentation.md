@@ -13,7 +13,28 @@ original spec). One `run()` call:
    proposed point into a real genome, evaluate it against the dataset's **train** split only,
    score it, tell the strategy, checkpoint, check convergence.
 4. On stop, re-evaluates baseline and best-candidate on the **validation** split, runs a paired
-   bootstrap comparison, and produces a recommendation.
+   bootstrap comparison and a confidence-bound safety check, and produces a recommendation. The
+   **holdout** split is not touched here — the promotion review consumes it (docs/promotion.md).
+
+## Constraint-aware search
+
+"Score it" is not just the weighted fitness. Each candidate is checked against the same gates
+promotion will apply — the safety limits, the quality floor, and the cost/latency caps relative to
+the baseline (evaluated once up front on the train split) — and its fitness is divided by
+`1 + constraint_penalty × violation`. `best` is tracked feasible-first: a candidate inside all limits
+beats one outside them whatever its raw fitness. `search_safety_margin` (0.03) and
+`search_quality_margin` (0.02) aim the search that far inside the safety limits and the quality
+floor, so the winner has headroom against split-to-split noise. A plateau is not convergence until
+a feasible candidate exists. Each `CandidateEvaluated` event records `feasible` and
+`constraint_violation`; `ExperimentResult.selected_feasible` records whether the winner made it.
+Rationale and measurements: ADR-0014.
+
+## Which dataset
+
+`ExperimentConfig.dataset_id` records the dataset the experiment was created with (falling back to
+`<application_id>-dataset` for older experiments), and `ExperimentResult` records the dataset
+version it actually ran against, so a later promotion review measures the holdout of the same
+version.
 
 ## Budget enforcement
 

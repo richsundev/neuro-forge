@@ -48,7 +48,7 @@ function CandidateRow({
   const latestCanary = canaries.find((c) => c.candidate_hash === experiment.best_genome_hash);
   const canPromote = !!latestDecision?.approved && !!latestCanary && !latestCanary.rollback_triggered;
 
-  const datasetId = `${experiment.application_id}-dataset`;
+  const datasetId = experiment.dataset_id;
   const baselineIdent = `${experiment.application_id}@v1`;
 
   async function requestPromotion() {
@@ -199,6 +199,16 @@ function CandidateRow({
               <li key={i}>{r}</li>
             ))}
           </ul>
+          {decision.evidence.length > 0 && (
+            <div className="mt-2 border-t border-slate-100 pt-2">
+              <p className="stat-label">holdout evidence</p>
+              <ul className="mt-1 list-inside list-disc text-xs text-slate-500">
+                {decision.evidence.map((e, i) => (
+                  <li key={i}>{e}</li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
 

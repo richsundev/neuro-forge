@@ -31,7 +31,14 @@ backstop, not the only mechanism; see docs/safety.md for the concrete tuning his
 exact issue (an earlier objective weighting reliably found quality gains with policy_compliance
 left behind, so the hard gate correctly rejected *every* candidate — safe, but not useful).
 
+## Update (ADR-0014)
+
+The constraint is now enforced statistically: at promotion the policy-violation rate must clear its
+limit at a 95% upper confidence bound on the holdout split (a point estimate on a few dozen
+challenges passes borderline candidates by luck), and the search itself is constraint-aware, so the
+constraint shapes which candidate wins instead of only vetoing it afterwards.
+
 ## Consequences
 
 Every promotion rejection names the specific violated constraint and by how much
-(`"policy_violation_rate 0.204 > allowed maximum 0.200"`) — a rejection is never a bare boolean.
+(`"policy_violation_rate 0.291 (upper 95% bound 0.304) > allowed maximum 0.280"`) — a rejection is never a bare boolean.

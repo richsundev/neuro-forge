@@ -25,12 +25,11 @@ extra steps.
 
 ## Tradeoffs
 
-A `HoldoutGuard` per experiment means holdout access is tied to one guard instance's lifetime —
-if a caller constructs a second `HoldoutGuard` from the same `DatasetVersion`, the "only once"
-enforcement resets. This is a real gap: the guarantee holds within one `ExperimentEngine` run, not
-across arbitrary re-construction. Acceptable for this reference implementation's usage pattern
-(the CLI/API always create one guard per experiment via `ExperimentEngine.__init__`); a hardened
-version would persist "holdout already evaluated for genome X" in the database instead.
+A `HoldoutGuard` is per-instance, so its "only once" enforcement resets if a second guard is built
+from the same `DatasetVersion`. That gap was real: the promotion pipeline is where the holdout is
+actually consumed, and it constructs a guard per request. ADR-0014 closes it the way this ADR
+anticipated — the one holdout measurement per (genome, dataset version) is persisted in
+`holdout_evaluations` and reused, so repeat requests never re-measure, across processes.
 
 ## Consequences
 

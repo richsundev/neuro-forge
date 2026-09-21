@@ -16,6 +16,8 @@ from neuroforge.datasets.dataset import DatasetVersion
 from neuroforge.datasets.evolution import evolve_if_saturated, seed_dataset
 from neuroforge.db.models import ExperimentRecord
 from neuroforge.db.repository import (
+    dataset_for_experiment,
+    genome_from_record,
     get_experiment,
     get_genome,
     latest_canary_run,
@@ -28,7 +30,6 @@ from neuroforge.db.repository import (
     save_experiment,
     save_genome,
     save_promotion_approval,
-    save_promotion_decision,
     set_genome_status,
     upsert_application,
 )
@@ -40,10 +41,10 @@ from neuroforge.experiments.checkpoint import ExperimentCheckpoint
 from neuroforge.experiments.engine import ExperimentConfig, ExperimentEngine
 from neuroforge.experiments.spaces import search_space_for_domain
 from neuroforge.genomes.schema import PromotionStatus, SystemGenome
-from neuroforge.promotion.canary import simulate_canary
-from neuroforge.promotion.gates import PromotionGateConfig, evaluate_promotion
-from neuroforge.promotion.safety import SafetyConstraints
+from neuroforge.promotion.canary import fresh_traffic, simulate_canary
+from neuroforge.promotion.review import ReviewError, review_promotion
 from neuroforge.providers.registry import get_provider
+from neuroforge.util import stable_int
 
 app = typer.Typer(help="NeuroForge: autonomous LLM system evolution & experimentation engine.")
 app_cmd = typer.Typer(help="Manage applications.")
@@ -76,7 +77,7 @@ def _resolve_genome(session, ident: str) -> SystemGenome:
         records = list_genomes_for_system(session, system_id)
         for r in records:
             if r.version == int(version_str):
-                return SystemGenome.model_validate(r.data)
+                return genome_from_record(r)
         raise typer.BadParameter(f"no genome found for {ident}")
     genome = get_genome(session, ident)
     if genome is None:
@@ -122,7 +123,7 @@ def genome_show(ident: str) -> None:
 
 
 @dataset_cmd.command("seed")
-def dataset_seed(dataset_id: str, domain: str = "forge-support", n: int = 100, seed: int = 1) -> None:
+def dataset_seed(dataset_id: str, domain: str = "forge-support", n: int = 300, seed: int = 1) -> None:
     d = get_domain(domain)
     dataset = seed_dataset(d, dataset_id, n=n, seed=seed)
     with session_scope() as session:
@@ -191,7 +192,7 @@ def experiment_create(
             save_genome(session, baseline)
         dataset = latest_dataset_version(session, dataset_id)
         if dataset is None:
-            dataset = seed_dataset(d, dataset_id, n=100, seed=seed)
+            dataset = seed_dataset(d, dataset_id, n=300, seed=seed)
             save_dataset_version(session, dataset)
 
         from neuroforge.experiments.budget import ExperimentBudget
@@ -199,6 +200,7 @@ def experiment_create(
         config = ExperimentConfig(
             experiment_id=experiment_id,
             domain_name=domain,
+            dataset_id=dataset_id,
             search_strategy=strategy,
             search_space=search_space_for_domain(domain),
             batch_size=batch_size,
@@ -226,8 +228,7 @@ def experiment_run(experiment_id: str) -> None:
         config = ExperimentConfig.model_validate(record.config)
         baseline = get_genome_by_system_version(session, record.application_id, 1)
         assert baseline is not None
-        dataset_id = f"{record.application_id}-dataset"
-        dataset = latest_dataset_version(session, dataset_id)
+        dataset = dataset_for_experiment(session, record.application_id, config)
         assert dataset is not None, "dataset missing — this should not happen if experiment was created via the CLI"
 
     engine = ExperimentEngine(config, baseline, dataset, state_dir() / experiment_id)
@@ -239,6 +240,7 @@ def experiment_run(experiment_id: str) -> None:
 
     console.print(f"[bold]{experiment_id}[/] finished: {result.status} ({result.stop_reason})")
     console.print(f"generations={result.generations_completed} candidates={result.candidates_evaluated}")
+    console.print(f"best genome: {SystemGenome.model_validate(result.best_genome).hash()}")
     console.print(f"comparison: {result.comparison['summary']}")
     console.print(f"[bold]{result.recommendation}[/]")
 
@@ -334,34 +336,19 @@ def get_domain_for_dataset(dataset: DatasetVersion):
 
 @promotion_cmd.command("request")
 def promotion_request(genome_hash: str, experiment_id: str) -> None:
+    """Review a candidate on the dataset's holdout split (measured once, reused on repeat) against
+    the gates and safety limits in the experiment's own config."""
     with session_scope() as session:
-        record = get_experiment(session, experiment_id)
-        if record is None or record.result is None:
-            raise typer.BadParameter(f"experiment '{experiment_id}' has no completed result yet")
-        result = record.result
-        from neuroforge.evaluation.aggregate import AggregateMetrics
-        from neuroforge.evaluation.statistics import Conclusion
-
-        baseline_agg = AggregateMetrics(genome_hash="baseline", n_evaluations=0, metrics=result["baseline_metrics"])
-        candidate_agg = AggregateMetrics(genome_hash=genome_hash, n_evaluations=0, metrics=result["best_metrics"])
-        from neuroforge.evaluation.statistics import ComparisonResult
-
-        comparison = ComparisonResult(
-            mean_diff=result["comparison"]["mean_diff"],
-            relative_diff=result["comparison"]["relative_diff"],
-            ci_low=result["comparison"]["ci_low"],
-            ci_high=result["comparison"]["ci_high"],
-            effect_size=result["comparison"]["effect_size"],
-            confidence=result["comparison"]["confidence"],
-            conclusion=Conclusion(result["comparison"]["conclusion"]),
-        )
-        decision = evaluate_promotion(
-            baseline_agg, candidate_agg, comparison, PromotionGateConfig(), SafetyConstraints()
-        )
-        save_promotion_decision(session, genome_hash, experiment_id, decision)
+        try:
+            review = review_promotion(session, experiment_id, genome_hash)
+        except ReviewError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+    decision = review.decision
     console.print(f"approved={decision.approved} next_status={decision.next_status.value}")
     for reason in decision.reasons:
         console.print(f"- {reason}")
+    for line in decision.evidence:
+        console.print(f"  [dim]evidence:[/] {line}")
 
 
 @promotion_cmd.command("promote")
@@ -405,8 +392,11 @@ def canary_run(
 
         domain = get_domain_for_dataset(dataset)
         provider = get_provider("mock")
-        traffic = (dataset.split("validation") + dataset.split("train"))[:n_requests]
-        result = simulate_canary(domain, provider, baseline, candidate, traffic, traffic_fraction)
+        traffic = fresh_traffic(domain, dataset, n_requests, stable_int("canary-traffic", candidate.hash()))
+        try:
+            result = simulate_canary(domain, provider, baseline, candidate, traffic, traffic_fraction)
+        except ValueError as exc:
+            raise typer.BadParameter(str(exc)) from exc
         save_canary_result(session, candidate.hash(), baseline.hash(), result)
 
     console.print(f"rollback_triggered={result.rollback_triggered}")

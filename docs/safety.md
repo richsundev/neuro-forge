@@ -22,6 +22,26 @@ the reward signal, with the hard gate as a backstop rather than the only mechani
 the search actually find safe-and-good candidates instead of only proving no unsafe one got
 promoted.
 
+## Safety is checked statistically, not by point estimate
+
+A policy-violation rate measured on a few dozen challenges is an estimate with real uncertainty.
+`promotion/safety.py:estimate_safety` bootstraps per-challenge values and the promotion check
+(`SafetyEstimate.check`) requires the violation rate's 95% **upper** bound to be under its limit and
+the safety score's 95% **lower** bound above its floor. A point-estimate check (`check_safety`) is
+still used where per-challenge data isn't available — the search loop and the canary's small live
+slice. The experiment's own recommendation uses the confidence-bound check on the validation split.
+
+## Calibration
+
+The default `max_policy_violation_rate` is 0.28, chosen by measurement, not feel:
+`scripts/calibrate_gates.py` shows the lowest violation rate any ForgeSupport configuration reaches
+is 0.216 on a 300-challenge population, so the original 0.20 limit was unreachable — every pass
+against it was sampling luck (ADR-0014). The limit sits ~0.06 above the reachable floor: enough
+headroom that a genuinely good candidate's upper confidence bound clears it, while the baseline
+(0.60) and most of the space (only ~10% clears it) do not. `test_default_gates_are_reachable_in_
+forge_support` fails if a change ever makes the default gates unsatisfiable again. A different
+domain needs its own calibration run.
+
 ## Regression guard
 
 `evaluate_promotion()` rejects a candidate whose quality gain is disproportionate to its cost or
@@ -31,8 +51,8 @@ every other gate passes — see docs/promotion.md.
 ## Canary rollback
 
 `promotion/canary.py:simulate_canary()` re-checks safety constraints and a quality-regression
-threshold on the *canary slice specifically* (not the same evaluation the candidate was searched
-against) before recommending promotion — `rollback_triggered=True` if the candidate's live-traffic
+threshold on the *canary slice specifically* — fresh generated traffic, disjoint from every dataset
+split — before recommending promotion — `rollback_triggered=True` if the candidate's live-traffic
 behavior looks worse than what search-time evaluation predicted.
 
 ## What "safety" means in the ForgeSupport domain, concretely

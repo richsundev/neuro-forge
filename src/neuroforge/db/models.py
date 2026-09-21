@@ -7,7 +7,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -84,7 +94,29 @@ class PromotionRecord(Base):
     approved: Mapped[bool] = mapped_column(default=False)
     next_status: Mapped[str] = mapped_column(String(30))
     reasons: Mapped[dict] = mapped_column(JSON)
+    evidence: Mapped[list | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class HoldoutEvaluationRecord(Base):
+    """The one-and-only holdout measurement of a candidate against a dataset version. Persisting it
+    (rather than re-evaluating on every promotion request) is what makes "the holdout is evaluated
+    at most once per candidate" true across processes and repeated requests, not just within one
+    HoldoutGuard instance."""
+
+    __tablename__ = "holdout_evaluations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    genome_hash: Mapped[str] = mapped_column(String(32), ForeignKey("system_genomes.hash"), index=True)
+    experiment_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    dataset_id: Mapped[str] = mapped_column(String(100))
+    dataset_version: Mapped[int] = mapped_column(Integer)
+    evidence: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    __table_args__ = (
+        UniqueConstraint("genome_hash", "dataset_id", "dataset_version", name="uq_holdout_once"),
+    )
 
 
 class PromotionApprovalRecord(Base):

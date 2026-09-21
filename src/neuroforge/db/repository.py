@@ -13,13 +13,15 @@ from neuroforge.db.models import (
     DatasetVersionRecord,
     ExperimentRecord,
     GenomeRecord,
+    HoldoutEvaluationRecord,
     PromotionApprovalRecord,
     PromotionRecord,
 )
 from neuroforge.experiments.engine import ExperimentConfig, ExperimentResult
-from neuroforge.genomes.schema import SystemGenome
+from neuroforge.genomes.schema import PromotionStatus, SystemGenome
 from neuroforge.promotion.canary import CanaryResult
 from neuroforge.promotion.gates import PromotionDecision
+from neuroforge.promotion.holdout import HoldoutEvidence
 
 
 def upsert_application(session: Session, app_id: str, name: str, domain_name: str, description: str = "") -> ApplicationRecord:
@@ -48,9 +50,18 @@ def save_genome(session: Session, genome: SystemGenome) -> GenomeRecord:
     return record
 
 
+def genome_from_record(record: GenomeRecord) -> SystemGenome:
+    """The stored `data` snapshot is taken when the genome is first saved; `status` is what the
+    promotion pipeline updates afterwards, so it lives in the column and is applied here. (Status
+    is metadata, not part of the content hash.)"""
+    return SystemGenome.model_validate(record.data).model_copy(
+        update={"status": PromotionStatus(record.status)}
+    )
+
+
 def get_genome(session: Session, genome_hash: str) -> SystemGenome | None:
     record = session.get(GenomeRecord, genome_hash)
-    return SystemGenome.model_validate(record.data) if record else None
+    return genome_from_record(record) if record else None
 
 
 def list_genomes_for_system(session: Session, system_id: str) -> list[GenomeRecord]:
@@ -137,9 +148,59 @@ def save_promotion_decision(
         approved=decision.approved,
         next_status=decision.next_status.value,
         reasons=decision.reasons,
+        evidence=decision.evidence,
+    )
+    session.add(record)
+    _advance_status(session, genome_hash, decision.next_status.value)
+    return record
+
+
+def _advance_status(
+    session: Session, genome_hash: str, new_status: str, only_from: set[str] | None = None
+) -> None:
+    """Keep `system_genomes.status` (what the Evolution Graph shows) in step with the pipeline.
+    PROMOTED is terminal here: a repeat promotion request or canary never downgrades a genome that
+    a human has already taken live."""
+    record = session.get(GenomeRecord, genome_hash)
+    if record is None or record.status == PromotionStatus.PROMOTED.value:
+        return
+    if only_from is not None and record.status not in only_from:
+        return
+    record.status = new_status
+
+
+def get_holdout_evaluation(
+    session: Session, genome_hash: str, dataset_id: str, dataset_version: int
+) -> HoldoutEvaluationRecord | None:
+    return session.scalar(
+        select(HoldoutEvaluationRecord).where(
+            HoldoutEvaluationRecord.genome_hash == genome_hash,
+            HoldoutEvaluationRecord.dataset_id == dataset_id,
+            HoldoutEvaluationRecord.dataset_version == dataset_version,
+        )
+    )
+
+
+def save_holdout_evaluation(
+    session: Session, genome_hash: str, experiment_id: str | None, evidence: HoldoutEvidence
+) -> HoldoutEvaluationRecord:
+    record = HoldoutEvaluationRecord(
+        genome_hash=genome_hash,
+        experiment_id=experiment_id,
+        dataset_id=evidence.dataset_id,
+        dataset_version=evidence.dataset_version,
+        evidence=evidence.model_dump(mode="json"),
     )
     session.add(record)
     return record
+
+
+def dataset_for_experiment(
+    session: Session, application_id: str, config: ExperimentConfig
+) -> DatasetVersion | None:
+    """The dataset an experiment runs against: the one it was created with, falling back to the
+    `<application_id>-dataset` convention for experiments created before `dataset_id` was recorded."""
+    return latest_dataset_version(session, config.dataset_id or f"{application_id}-dataset")
 
 
 def save_canary_result(session: Session, candidate_hash: str, baseline_hash: str, result: CanaryResult) -> CanaryRecord:
@@ -157,6 +218,17 @@ def save_canary_result(session: Session, candidate_hash: str, baseline_hash: str
         },
     )
     session.add(record)
+    # A canary only means something for a genome that already cleared the promotion gates.
+    _advance_status(
+        session,
+        candidate_hash,
+        PromotionStatus.ROLLED_BACK.value if result.rollback_triggered else PromotionStatus.CANARY.value,
+        only_from={
+            PromotionStatus.APPROVED.value,
+            PromotionStatus.CANARY.value,
+            PromotionStatus.ROLLED_BACK.value,
+        },
+    )
     return record
 
 

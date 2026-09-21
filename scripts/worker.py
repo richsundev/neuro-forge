@@ -21,8 +21,8 @@ def _state_dir() -> Path:
 
 def run_one(experiment_id: str) -> None:
     from neuroforge.db.repository import (
+        dataset_for_experiment,
         get_experiment,
-        latest_dataset_version,
         list_genomes_for_system,
         save_experiment,
         save_genome,
@@ -45,7 +45,7 @@ def run_one(experiment_id: str) -> None:
             ),
             None,
         )
-        dataset = latest_dataset_version(session, f"{record.application_id}-dataset")
+        dataset = dataset_for_experiment(session, record.application_id, config)
         application_id = record.application_id
         save_experiment(session, application_id, config, status="running")
 

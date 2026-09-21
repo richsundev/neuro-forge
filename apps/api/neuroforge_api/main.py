@@ -21,6 +21,8 @@ from sqlalchemy import select
 from neuroforge.datasets.evolution import evolve_if_saturated, seed_dataset
 from neuroforge.db.models import ApiKeyRecord, ApplicationRecord, DatasetVersionRecord, GenomeRecord
 from neuroforge.db.repository import (
+    dataset_for_experiment,
+    genome_from_record,
     get_experiment,
     get_genome,
     latest_canary_run,
@@ -36,15 +38,14 @@ from neuroforge.db.repository import (
     save_experiment,
     save_genome,
     save_promotion_approval,
-    save_promotion_decision,
     set_genome_status,
     upsert_application,
 )
 from neuroforge.db.session import init_db, session_scope
 from neuroforge.domains import get_domain
-from neuroforge.evaluation.aggregate import AggregateMetrics, aggregate
+from neuroforge.evaluation.aggregate import aggregate
 from neuroforge.evaluation.pareto import ParetoPoint, pareto_frontier
-from neuroforge.evaluation.statistics import ComparisonResult, Conclusion, compare
+from neuroforge.evaluation.statistics import ComparisonResult, compare
 from neuroforge.experiments.budget import ExperimentBudget
 from neuroforge.experiments.checkpoint import ExperimentCheckpoint
 from neuroforge.experiments.engine import ExperimentConfig, ExperimentEngine
@@ -54,10 +55,10 @@ from neuroforge.experiments.spaces import search_space_for_domain
 from neuroforge.genomes.lineage import GenomeStore
 from neuroforge.genomes.schema import PromotionStatus, SystemGenome
 from neuroforge.observability import configure_tracing, get_tracer
-from neuroforge.promotion.canary import simulate_canary
-from neuroforge.promotion.gates import PromotionGateConfig, evaluate_promotion
-from neuroforge.promotion.safety import SafetyConstraints
+from neuroforge.promotion.canary import fresh_traffic, simulate_canary
+from neuroforge.promotion.review import ReviewError, review_promotion
 from neuroforge.providers.registry import get_provider
+from neuroforge.util import stable_int
 from neuroforge_api.auth import (
     Principal,
     audit,
@@ -79,6 +80,10 @@ from neuroforge_api.schemas import (
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("neuroforge.api")
+
+# Big enough that the validation and holdout splits (~15% each) hold a few dozen challenges — with
+# 100 they held 15-25, too few for the confidence bounds the safety checks rely on.
+DEFAULT_DATASET_SIZE = 300
 
 STATE_DIR_ENV = "NEUROFORGE_STATE_DIR"
 
@@ -157,7 +162,7 @@ def _resolve_genome(session, ident: str) -> SystemGenome:
         system_id, version_str = ident.split("@v", 1)
         for r in list_genomes_for_system(session, system_id):
             if r.version == int(version_str):
-                return SystemGenome.model_validate(r.data)
+                return genome_from_record(r)
         raise HTTPException(404, f"no genome found for {ident}")
     genome = get_genome(session, ident)
     if genome is None:
@@ -225,7 +230,7 @@ def genome_lineage(system_id: str, principal: Principal = Depends(require_role("
         rows = list_genomes_for_system(session, system_id)
     store = GenomeStore()
     for r in sorted(rows, key=lambda r: r.version):
-        store.add(SystemGenome.model_validate(r.data))
+        store.add(genome_from_record(r))
     return store.lineage_graph(system_id)
 
 
@@ -293,12 +298,13 @@ def create_experiment(body: ExperimentCreateRequest, principal: Principal = Depe
             save_genome(session, baseline)
         dataset = latest_dataset_version(session, dataset_id)
         if dataset is None:
-            dataset = seed_dataset(domain, dataset_id, n=100, seed=body.seed)
+            dataset = seed_dataset(domain, dataset_id, n=DEFAULT_DATASET_SIZE, seed=body.seed)
             save_dataset_version(session, dataset)
 
         config = ExperimentConfig(
             experiment_id=body.experiment_id,
             domain_name=body.domain,
+            dataset_id=dataset_id,
             search_strategy=body.strategy,
             search_space=search_space_for_domain(body.domain),
             batch_size=body.batch_size,
@@ -319,6 +325,7 @@ def list_experiments_endpoint(principal: Principal = Depends(require_role("viewe
             {
                 "experiment_id": r.experiment_id,
                 "application_id": r.application_id,
+                "dataset_id": (r.config or {}).get("dataset_id") or f"{r.application_id}-dataset",
                 "domain": r.domain_name,
                 "strategy": r.search_strategy,
                 "status": r.status,
@@ -356,7 +363,7 @@ def run_experiment_endpoint(experiment_id: str, principal: Principal = Depends(r
         for r in list_genomes_for_system(session, record.application_id):
             if r.version == 1:
                 baseline = SystemGenome.model_validate(r.data)
-        dataset = latest_dataset_version(session, f"{record.application_id}-dataset")
+        dataset = dataset_for_experiment(session, record.application_id, config)
         application_id = record.application_id
 
     if baseline is None or dataset is None:
@@ -482,26 +489,19 @@ def compare_candidates(
 
 @app.post("/api/v1/promotions", tags=["promotions"])
 def request_promotion(body: PromotionRequest, principal: Principal = Depends(require_role("operator"))) -> dict:
+    """Review a candidate on the dataset's holdout split — measured once and reused on repeat
+    requests — against the gates and safety limits in the experiment's own config."""
     with session_scope() as session:
-        record = get_experiment(session, body.experiment_id)
-        if record is None or record.result is None:
-            raise HTTPException(400, f"experiment '{body.experiment_id}' has no completed result yet")
-        result = record.result
-        baseline_agg = AggregateMetrics(genome_hash="baseline", n_evaluations=0, metrics=result["baseline_metrics"])
-        candidate_agg = AggregateMetrics(genome_hash=body.genome_hash, n_evaluations=0, metrics=result["best_metrics"])
-        comparison = ComparisonResult(
-            mean_diff=result["comparison"]["mean_diff"],
-            relative_diff=result["comparison"]["relative_diff"],
-            ci_low=result["comparison"]["ci_low"],
-            ci_high=result["comparison"]["ci_high"],
-            effect_size=result["comparison"]["effect_size"],
-            confidence=result["comparison"]["confidence"],
-            conclusion=Conclusion(result["comparison"]["conclusion"]),
-        )
-        decision = evaluate_promotion(baseline_agg, candidate_agg, comparison, PromotionGateConfig(), SafetyConstraints())
-        save_promotion_decision(session, body.genome_hash, body.experiment_id, decision)
-    audit(principal.name, "request_promotion", {"genome_hash": body.genome_hash, "approved": decision.approved})
-    return decision.model_dump(mode="json")
+        try:
+            review = review_promotion(session, body.experiment_id, body.genome_hash)
+        except ReviewError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    audit(
+        principal.name,
+        "request_promotion",
+        {"genome_hash": body.genome_hash, "approved": review.decision.approved},
+    )
+    return review.decision.model_dump(mode="json")
 
 
 @app.get("/api/v1/promotions", tags=["promotions"])
@@ -515,6 +515,7 @@ def list_promotions_endpoint(principal: Principal = Depends(require_role("viewer
                 "approved": r.approved,
                 "next_status": r.next_status,
                 "reasons": r.reasons,
+                "evidence": r.evidence or [],
                 "created_at": r.created_at.isoformat(),
             }
             for r in rows
@@ -573,8 +574,16 @@ def run_canary(body: CanaryRequest, principal: Principal = Depends(require_role(
             raise HTTPException(404, f"unknown dataset '{body.dataset_id}'")
         domain = get_domain(_domain_for_dataset(dataset))
         provider = get_provider("mock")
-        traffic = (dataset.split("validation") + dataset.split("train"))[: body.n_requests]
-        result = simulate_canary(domain, provider, baseline, candidate, traffic, body.traffic_fraction)
+        traffic_seed = (
+            body.traffic_seed
+            if body.traffic_seed is not None
+            else stable_int("canary-traffic", candidate.hash())
+        )
+        traffic = fresh_traffic(domain, dataset, body.n_requests, traffic_seed)
+        try:
+            result = simulate_canary(domain, provider, baseline, candidate, traffic, body.traffic_fraction)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         save_canary_result(session, candidate.hash(), baseline.hash(), result)
     audit(principal.name, "run_canary", {"candidate_hash": body.candidate_hash, "rollback": result.rollback_triggered})
     return {

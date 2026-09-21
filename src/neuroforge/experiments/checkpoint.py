@@ -34,6 +34,9 @@ class ExperimentCheckpoint(BaseModel):
     tell_batches: list[TellBatch] = Field(default_factory=list)
     best_genome: dict[str, Any] | None = None
     best_fitness: float = float("-inf")
+    # Selection is feasible-first (see engine.py), so resuming needs to know whether the stored
+    # best already clears the constraints, not just its fitness.
+    best_feasible: bool = False
     dataset_version_hash: str = ""
 
     def generations_completed(self) -> int:

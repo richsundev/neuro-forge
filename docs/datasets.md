@@ -18,7 +18,15 @@ convention:
   candidate and run the statistical comparison.
 - `evaluate_holdout(genome_hash)` — the *only* way to reach the holdout split, and it raises
   `HoldoutViolation` if called twice for the same genome hash. Re-running a holdout evaluation to
-  chase a better number would defeat the entire point of having one.
+  chase a better number would defeat the entire point of having one. It is called by the promotion
+  review (`promotion/review.py`), never by the experiment engine (a test pins this), and the one
+  measurement per (genome, dataset version) is persisted in `holdout_evaluations` so the
+  "once" holds across processes and repeated requests, not just within one guard instance.
+
+Split sizes matter: the confidence bounds behind safety checks need a few dozen challenges per
+split. `seed_dataset` defaults to 300 challenges (the CLI, API and reproduce script all use it),
+which realizes roughly 205 / 45 / 50 train / validation / holdout — at 100 challenges the
+validation and holdout splits held 15–25, too few to bound a rate.
 
 `deterministic_split()` assigns each challenge to train/validation/holdout via a stable hash of
 `(seed, challenge_id)` — the same challenge always lands in the same split even as the dataset

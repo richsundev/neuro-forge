@@ -24,41 +24,53 @@ Autonomous *experimentation*, never autonomous *deployment* — see [ADR-0013](d
 ## What actually happens when you run it
 
 `ForgeSupport`, the demo customer-support agent NeuroForge evolves, starts with a naive baseline
-(direct prompting, greedy tool selection, no reranking). One evolutionary-search experiment later
-(240 real candidate genomes evaluated, ~1 second wall-clock against the deterministic mock
-provider):
+(direct prompting, greedy tool selection, no reranking). One constraint-aware evolutionary-search
+experiment later (168 real candidate genomes evaluated before the fitness curve plateaued, ~3
+seconds wall-clock against the deterministic mock provider):
 
 | metric | baseline (v1) | best candidate found | change |
 |---|---|---|---|
-| quality | 0.498 | 0.725 | **+45.5%** |
-| policy_compliance | 0.369 | 0.803 | **+117.7%** |
-| tool_success | 0.298 | 0.684 | **+130%** |
-| safety_score | 0.845 | 0.933 | +10.4% |
-| cost / request | $0.0012 | $0.0019 | +58% |
-| latency | 767ms | 437ms | **−43%** |
-| failure_rate | 73.3% | 0.0% | **−100%** |
+| quality | 0.512 | 0.650 | **+27.0%** |
+| policy_compliance | 0.403 | 0.754 | **+87.0%** |
+| tool_success | 0.351 | 0.647 | **+84.5%** |
+| task_success | 0.471 | 0.684 | +45.1% |
+| safety_score | 0.868 | 0.940 | +8.3% |
+| cost / request | $0.0012 | $0.0004 | **−62.9%** |
+| latency | 769ms | 362ms | **−52.9%** |
+| failure_rate | 60.0% | 0.0% | **−100%** |
 
-Statistical comparison (paired bootstrap on the held-out validation split, never the search
-split): **+45.5% (95% CI [+36.3%, +54.2%]) → `LIKELY_IMPROVEMENT`**, recommendation
-**`PROMOTE TO CANARY`**.
+Statistical comparison (paired bootstrap on the validation split, never the search split):
+**+27.0% (95% CI [+21.5%, +32.5%]) → `LIKELY_IMPROVEMENT`**, recommendation **`PROMOTE TO CANARY`**.
+
+That is the experiment's own view. The promotion decision is made separately, on the **holdout
+split** that neither the search nor the validation ever touched, with safety checked at 95%
+confidence bounds rather than as a point estimate:
+
+> holdout n=50 — quality **+27.6% (95% CI [+22.4%, +32.8%])**, cost −63.0% (limit +10%), latency
+> −53.5% (limit +15%), safety_score 0.940 (lower bound 0.934 ≥ 0.85), policy_violation_rate 0.246
+> (**upper bound 0.267 ≤ 0.28**) → **APPROVED**
+
+The search is constraint-aware, so the winner is chosen from candidates that sit inside the safety,
+quality, cost and latency limits — with headroom, not on the boundary — rather than being the
+highest-fitness candidate that then passes or fails the later checks on noise. Across 10 seeds at
+this budget, 8 searches found a within-limits winner and all 8 were approved on the holdout; the
+other 2 didn't, and were reported as `DO NOT PROMOTE` with the specific limit they missed. The
+recommendation is evidence-driven, not scripted to always look good — see
+[docs/promotion.md](docs/promotion.md) and [ADR-0014](docs/adr/0014-holdout-verified-promotion.md).
 
 Every one of those numbers is computed live by the code in this repo — reproduce it yourself:
 
 ```bash
 make reproduce
 cat reproduce_output/report.md
+python scripts/calibrate_gates.py   # how much of the search space clears each gate (and all of them)
 ```
-
-Different seeds and objective weights sometimes land on `DO NOT PROMOTE` instead (a candidate that
-improves quality but crosses a safety threshold gets rejected, full stop — see
-[docs/safety.md](docs/safety.md)). That's the point: the recommendation is evidence-driven, not
-scripted to always look good.
 
 ---
 
 ## Screenshots
 
-**Evolution Graph** — every genome ever produced for an application, with real mutation lineage:
+**Evolution Graph** — the baseline and each experiment's selected winner, colored by their real promotion status (here: one promoted, one approved, one rejected):
 
 ![Evolution Graph](docs/images/evolution-graph.png)
 
@@ -72,11 +84,9 @@ score can't be won by gaming a fixed, easy dataset:
 
 ![Challenge Evolution](docs/images/challenge-evolution.png)
 
-**Promotion** — request promotion and run a canary from the UI; the two checks are genuinely
-independent (this candidate passed promotion gates on its validation-split evaluation, then
-canary caught a real policy-violation rate on a larger sample and rolled it back). Note the
-"Promote to production" button stays disabled until an approved decision *and* a passed canary
-are both on record — that's the human-approval gate, and only an admin-role key can cross it:
+**Promotion** — request promotion (a holdout-split review with its evidence shown), run a canary on
+fresh traffic, then take the candidate live with an explicit, admin-only "Promote to production".
+That button stays disabled until an approved decision *and* a passed canary are both on record:
 
 ![Promotion](docs/images/promotions.png)
 
@@ -91,14 +101,16 @@ flowchart LR
         ME --> CAND[Candidate SystemGenomes]
     end
     CAND --> EVAL[Domain Evaluation<br/>ForgeSupport / SQLAgent / ResearchAgent]
-    EVAL --> FIT[Multi-objective fitness]
+    EVAL --> FIT["Multi-objective fitness,<br/>shrunk outside the limits"]
     FIT -->|tell| ME
-    FIT --> SEL[Best candidate]
+    FIT --> SEL["Best <i>feasible</i> candidate"]
     SEL --> VAL["Validation split re-eval +<br/>paired bootstrap comparison"]
-    VAL --> GATE{Promotion gates<br/>+ hard safety constraints}
-    GATE -->|approved| CANARY[Canary simulation]
+    VAL --> HOLD["Holdout review (once, persisted):<br/>gates + safety at 95% bounds"]
+    HOLD --> GATE{Approved?}
+    GATE -->|approved| CANARY["Canary on fresh traffic"]
     GATE -->|rejected| REJ[REJECTED, with reasons]
-    CANARY -->|safe| PROMOTED
+    CANARY -->|safe| HUMAN["Admin approval"]
+    HUMAN --> PROMOTED
     CANARY -->|regression| ROLLBACK[ROLLED_BACK]
 ```
 
@@ -124,15 +136,18 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 | Multi-objective fitness + true Pareto frontier | ✅ | `evaluation/objectives.py`, `evaluation/pareto.py` |
 | Statistical comparison (paired bootstrap, effect size) | ✅ | `evaluation/statistics.py` |
 | Evaluator ensemble + disagreement detection | ✅ | `evaluation/judges.py` |
-| Dataset versioning + holdout protection | ✅ | `datasets/`, [docs/datasets.md](docs/datasets.md) |
+| Dataset versioning + holdout protection (evaluated once per candidate, persisted) | ✅ | `datasets/`, [docs/datasets.md](docs/datasets.md), [ADR-0014](docs/adr/0014-holdout-verified-promotion.md) |
 | Benchmark evolution (harder challenges on saturation) | ✅ | `datasets/evolution.py` |
 | Failure-driven challenge generation | ✅ | `datasets/evolution.py:failure_driven_challenges` |
 | Budget enforcement (candidates/requests/cost/time) | ✅ | `experiments/budget.py` |
 | Checkpoint + resume (bit-identical to uninterrupted run) | ✅ | `experiments/checkpoint.py`, [ADR-0008](docs/adr/0008-checkpoint-replay-tell-batches.md) |
 | Cross-process reproducibility (verified, not assumed) | ✅ | [docs/reproducibility.md](docs/reproducibility.md) |
 | Promotion gates + regression guard | ✅ | `promotion/gates.py` |
-| Hard safety constraints (override fitness) | ✅ | `promotion/safety.py`, [ADR-0012](docs/adr/0012-hard-safety-constraints.md) |
-| Canary simulation + automatic rollback | ✅ | `promotion/canary.py` |
+| Promotion decided on holdout evidence, with the evidence recorded | ✅ | `promotion/review.py`, `promotion/holdout.py` |
+| Hard safety constraints (override fitness), checked at confidence bounds | ✅ | `promotion/safety.py`, [ADR-0012](docs/adr/0012-hard-safety-constraints.md) |
+| Constraint-aware search (feasible-first selection, shared gates) | ✅ | `experiments/engine.py` |
+| Gate calibration against the measured reachable range | ✅ | `scripts/calibrate_gates.py` |
+| Canary simulation on fresh traffic + automatic rollback | ✅ | `promotion/canary.py` |
 | Evolution Graph (signature feature) | ✅ | dashboard `/genomes/[systemId]` |
 | Challenge Evolution (signature feature) | ✅ | dashboard `/datasets` |
 | Promotion page (candidates, canary, history) — drives promotion/canary from the UI, not just CLI | ✅ | dashboard `/promotions` |
@@ -148,7 +163,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 | OpenTelemetry tracing (per-request, per-generation spans) | ✅ | `src/neuroforge/observability.py` |
 | Failure injection (6 scenarios, all pass) | ✅ | `make failure-all` |
 | CI (test/lint/typecheck/build/security) | ✅ | `.github/workflows/` |
-| 12 ADRs | ✅ (13) | `docs/adr/` |
+| 14 ADRs | ✅ | `docs/adr/` |
 | Reproducible research mode | ✅ | `make reproduce` |
 
 ## Technology stack
@@ -156,7 +171,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 **Backend**: Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0, Alembic, PostgreSQL (SQLite for
 local/CI), Redis, NumPy/SciPy. **Frontend**: Next.js 14 (App Router), TypeScript (strict),
 Tailwind CSS, Recharts. **Infra**: Docker Compose, Kubernetes, GitHub Actions. **Testing**:
-pytest (76 tests), mypy (strict), Ruff, ESLint, tsc.
+pytest (91 tests), mypy (strict), Ruff, ESLint, tsc.
 
 ## Quick start
 
@@ -171,7 +186,7 @@ docker compose up --build
 # Option B — local dev
 uv venv --python 3.12 .venv && uv pip install -e ".[dev]" -e ./apps/api
 cd apps/dashboard && npm install && cd ../..
-make test              # 76 tests, mock mode, no external services, ~3s
+make test              # 91 tests, mock mode, no external services, ~3s
 make reproduce           # full reproducible experiment -> reproduce_output/
 ```
 
@@ -179,25 +194,25 @@ make reproduce           # full reproducible experiment -> reproduce_output/
 
 ```bash
 neuroforge app create support-agent "Forge Support" --domain forge-support
-neuroforge dataset seed support-agent-dataset --domain forge-support --n 100
+neuroforge dataset seed support-agent-dataset --domain forge-support --n 300
 neuroforge experiment create exp-1 --system-id support-agent --dataset-id support-agent-dataset \
     --strategy evolutionary --batch-size 24 --max-batches 25 --max-candidates 240
-neuroforge experiment run exp-1                 # watch generations evolve, live
+neuroforge experiment run exp-1                 # prints the best genome's hash
 neuroforge genome show support-agent@v1          # inspect the baseline
 neuroforge candidate compare support-agent@v1 <best-hash> support-agent-dataset
-neuroforge canary run support-agent@v1 <best-hash> support-agent-dataset
-neuroforge promotion request <best-hash> exp-1        # PROMOTE or a specific rejection reason
+neuroforge promotion request <best-hash> exp-1        # holdout review: approved, or the exact limit missed
+neuroforge canary run support-agent@v1 <best-hash> support-agent-dataset   # fresh traffic
 neuroforge promotion promote <best-hash>              # human-approval gate — only if approved + canary passed
 ```
 
 Or drive the same flow from the dashboard: create the experiment via the API, watch it on
 `/experiments/exp-1` (fitness curve + Pareto frontier, live), `/genomes/support-agent` for the
-Evolution Graph, then `/promotions` to request promotion, run a canary, and — only once both have
-succeeded — click "Promote to production" (requires an admin-role API key), all with no CLI
-needed. The two checks upstream of that button are genuinely independent: a candidate can pass
-promotion gates on its validation-split evaluation and still get caught by canary on a larger,
-different traffic sample — that's not a bug, it's the point of having both, and it's exactly what
-gates the final promote action too.
+Evolution Graph (nodes carry their real status: APPROVED, CANARY, PROMOTED, ...), then
+`/promotions` to request promotion (the decision shows the holdout evidence behind it), run a canary
+on fresh traffic, and — only once both have succeeded — click "Promote to production" (requires an
+admin-role API key), all with no CLI needed. The checks upstream of that button are independent by
+construction: the promotion review measures the holdout split, the canary measures newly generated
+traffic, and a rejection at either names the exact limit that was missed.
 
 ## Documentation
 
@@ -221,7 +236,14 @@ gates the final promote action too.
   See [ADR-0010](docs/adr/0010-redis-queue-not-celery.md).
 - `NEUROFORGE_STATE_DIR` needs `ReadWriteMany` storage in Kubernetes (EFS/Filestore/NFS) since both
   the API and worker write to it — most cloud block storage is `ReadWriteOnce` only.
-- Canary simulation runs against mock/replay traffic, not real production traffic.
+- Canary simulation runs against generated mock traffic, not real production traffic, and its
+  candidate arm is small (~20 requests at the defaults) — a point-estimate smoke test, not a
+  confidence-bound check like the holdout review.
+- The numeric safety/cost/latency limits are calibrated to ForgeSupport's *simulated* scoring
+  model (`scripts/calibrate_gates.py`); a new domain needs its own calibration. SQLAgent and
+  ResearchAgent don't report `policy_compliance`, so only the safety-score bound applies to them.
+- A dataset's holdout is ~15–25% of its challenges (n=50 at 300), so its confidence bounds are
+  wide; tighter claims need a larger dataset.
 
 ## Roadmap
 

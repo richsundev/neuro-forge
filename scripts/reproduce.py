@@ -23,11 +23,13 @@ from neuroforge.experiments.engine import ExperimentConfig, ExperimentEngine
 from neuroforge.experiments.spaces import forge_support_search_space
 from neuroforge.genomes.schema import SystemGenome
 from neuroforge.mutations.policy import MutationPolicy
+from neuroforge.promotion.holdout import decide_from_evidence, evaluate_on_holdout
+from neuroforge.providers.registry import get_provider
 
 SEED = 11
 DOMAIN_NAME = "forge-support"
 SYSTEM_ID = "support-agent"
-N_CHALLENGES = 100
+N_CHALLENGES = 300
 
 
 def run_experiment(
@@ -38,6 +40,7 @@ def run_experiment(
     max_candidates: int = 240,
     batch_size: int = 24,
     max_batches: int = 25,
+    verify_holdout: bool = False,
 ) -> tuple[dict, float]:
     domain = get_domain(DOMAIN_NAME)
     dataset = seed_dataset(domain, f"{SYSTEM_ID}-dataset", n=N_CHALLENGES, seed=1)
@@ -61,7 +64,31 @@ def run_experiment(
     start = time.perf_counter()
     result = engine.run()
     elapsed = time.perf_counter() - start
-    return result.model_dump(mode="json"), elapsed
+    out = result.model_dump(mode="json")
+    out["dataset_splits"] = dataset.summary()["splits"]
+    if verify_holdout:
+        # The promotion pipeline's own check: the holdout split, evaluated once for the final
+        # candidate only, with the promotion gates applied at confidence bounds.
+        best = SystemGenome.model_validate(result.best_genome)
+        evidence = evaluate_on_holdout(
+            domain,
+            get_provider("mock"),
+            baseline,
+            best,
+            dataset,
+            confidence=config.confidence,
+            min_relative_improvement=config.min_relative_improvement,
+            seed=config.seed,
+        )
+        decision = decide_from_evidence(evidence, best.hash(), config.promotion_gates, config.safety_constraints)
+        out["holdout_verification"] = {
+            "approved": decision.approved,
+            "reasons": decision.reasons,
+            "evidence": decision.evidence,
+            "baseline_metrics": evidence.baseline_metrics,
+            "candidate_metrics": evidence.candidate_metrics,
+        }
+    return out, elapsed
 
 
 def strategy_comparison(state_dir: Path) -> list[dict]:
@@ -79,6 +106,7 @@ def strategy_comparison(state_dir: Path) -> list[dict]:
             {
                 "strategy": strategy,
                 "best_quality": result["best_metrics"]["quality"],
+                "feasible": result["selected_feasible"],
                 "candidates_evaluated": result["candidates_evaluated"],
                 "generations_completed": result["generations_completed"],
                 "wall_time_seconds": round(elapsed, 3),
@@ -137,6 +165,8 @@ def write_report(out_dir: Path, main_result: dict, strategy_rows: list[dict], ab
     comparison = main_result["comparison"]
     baseline = main_result["baseline_metrics"]
     best = main_result["best_metrics"]
+    splits = main_result["dataset_splits"]
+    holdout = main_result["holdout_verification"]
 
     def pct(key: str) -> str:
         b, c = baseline[key], best[key]
@@ -161,8 +191,11 @@ def write_report(out_dir: Path, main_result: dict, strategy_rows: list[dict], ab
         f"- domain: `{DOMAIN_NAME}`, {N_CHALLENGES} generated challenges across 8 adversarial "
         "categories (policy FAQ, refund requests, duplicate charges, conflicting order IDs, "
         "ambiguous requests, escalation, long-context policy, malformed tool responses)",
-        "- deterministic 70/15/15 train/validation/holdout split (see docs/reproducibility.md); "
-        "search happens only against train, this report's numbers are on validation",
+        "- deterministic hash-based train/validation/holdout split, nominally 70/15/15 (see "
+        f"docs/reproducibility.md); realized: {splits['train']} / {splits['validation']} / "
+        f"{splits['holdout']}. Search touches only train; the experiment's results below are on "
+        "validation; the holdout is evaluated once, for the final candidate only (see Holdout "
+        "Verification)",
         "",
         "## Baseline",
         "",
@@ -176,6 +209,11 @@ def write_report(out_dir: Path, main_result: dict, strategy_rows: list[dict], ab
         "- 12 tunable genome fields spanning model, prompt, retrieval, tools, and agent config",
         "- multi-objective fitness: quality (0.25) + task_success (0.20) + policy_compliance "
         "(0.20) + safety_score (0.15) − latency (0.10) − cost (0.05) − failure_rate (0.05)",
+        "- constraint-aware: fitness is shrunk in proportion to how far a candidate sits outside "
+        "the safety limits (aimed 0.03 inside them), the quality floor (0.02 inside) and the "
+        "cost/latency gates, and selection is feasible-first — a candidate within all limits "
+        "always beats one outside them, whatever its raw fitness. Selected candidate within "
+        f"limits on the search split: **{'yes' if main_result['selected_feasible'] else 'no'}**",
         "",
         "## Budget",
         "",
@@ -204,17 +242,31 @@ def write_report(out_dir: Path, main_result: dict, strategy_rows: list[dict], ab
         "",
         f"**{main_result['recommendation']}**",
         "",
+        "## Holdout Verification",
+        "",
+        "The promotion pipeline's own check, on data neither the search nor the experiment's "
+        "validation ever saw. The promotion gates are applied to these numbers, with safety "
+        "checked at 95% confidence bounds rather than as a point estimate:",
+        "",
+        f"**{'APPROVED' if holdout['approved'] else 'REJECTED'}** — "
+        + "; ".join(holdout["reasons"]),
+        "",
+    ]
+    lines += [f"- {e}" for e in holdout["evidence"]]
+    lines += [
+        "",
         "## Search Strategy Comparison",
         "",
         "Same budget (80 candidates), same seed, same dataset — random search vs. evolutionary "
         "search vs. Bayesian optimization vs. a UCB1 bandit:",
         "",
-        "| strategy | best quality | candidates | generations | wall time (s) | stop reason |",
-        "|---|---|---|---|---|---|",
+        "| strategy | best quality | within limits | candidates | generations | wall time (s) | stop reason |",
+        "|---|---|---|---|---|---|---|",
     ]
     for row in strategy_rows:
         lines.append(
-            f"| {row['strategy']} | {row['best_quality']:.4f} | {row['candidates_evaluated']} | "
+            f"| {row['strategy']} | {row['best_quality']:.4f} | {'yes' if row['feasible'] else 'no'} | "
+            f"{row['candidates_evaluated']} | "
             f"{row['generations_completed']} | {row['wall_time_seconds']} | {row['stop_reason']} |"
         )
 
@@ -239,8 +291,11 @@ def write_report(out_dir: Path, main_result: dict, strategy_rows: list[dict], ab
         "— it is a calibrated simulation of how model/config choices affect quality, cost, and "
         "latency, not a live model. Swapping in a real provider changes the numbers but not the "
         "optimization/evaluation machinery.",
-        "- The holdout split is never touched by this script; a real promotion decision additionally "
-        "requires a holdout evaluation (see `neuroforge promotion request`).",
+        "- The holdout split is evaluated exactly once, for the final candidate only (the strategy "
+        "comparison and ablation runs report validation-split numbers and never touch it). A real "
+        "promotion additionally runs a canary on fresh traffic (`neuroforge canary run`).",
+        "- The safety and cost/latency limits are calibrated to ForgeSupport's measured reachable "
+        "range (`python scripts/calibrate_gates.py`); a different domain needs its own calibration.",
         "- Single-seed run; the strategy comparison and ablation study use smaller budgets than the "
         "main experiment for reproduction speed, so treat their deltas as directional, not final.",
         "",
@@ -269,7 +324,7 @@ def main() -> None:
     out_dir.mkdir(parents=True)
 
     print("Running main experiment (evolutionary search)...")
-    main_result, elapsed = run_experiment("reproduce-main", "evolutionary", state_dir)
+    main_result, elapsed = run_experiment("reproduce-main", "evolutionary", state_dir, verify_holdout=True)
     main_result["comparison"]["strategy"] = "evolutionary"
     print(f"  done in {elapsed:.2f}s: {main_result['recommendation']}")
 

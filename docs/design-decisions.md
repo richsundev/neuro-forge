@@ -19,6 +19,7 @@ itself for the reasoning.
 | [0011](adr/0011-deterministic-mock-provider.md) | Deterministic mock LLM provider as default/CI backend |
 | [0012](adr/0012-hard-safety-constraints.md) | Hard safety constraints override the fitness score |
 | [0013](adr/0013-generation-separate-from-promotion.md) | Generation is fully separate from promotion |
+| [0014](adr/0014-holdout-verified-promotion.md) | Promotions are verified on the holdout, at confidence bounds, against calibrated limits |
 
 ## Bugs found and fixed during development (kept here deliberately)
 

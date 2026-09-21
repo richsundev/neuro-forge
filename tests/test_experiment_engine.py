@@ -73,9 +73,12 @@ def test_evaluation_timeout_marks_candidate_failed_but_experiment_continues(
     call_count = {"n": 0}
 
     def slow_evaluate(self, genome, challenge, provider):
-        call_count["n"] += 1
-        if call_count["n"] == 1:
-            time.sleep(2)
+        # Skip the baseline (version 1), which the engine evaluates up front, unbounded, to anchor
+        # the cost/latency limits; the first *candidate* evaluation is the one that must hang.
+        if genome.version > 1:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                time.sleep(2)
         return original_evaluate(self, genome, challenge, provider)
 
     monkeypatch.setattr(ForgeSupportDomain, "evaluate", slow_evaluate)

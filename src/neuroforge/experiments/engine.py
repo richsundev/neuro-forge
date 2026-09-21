@@ -5,7 +5,15 @@ strategy proposes becomes a real, hashed, lineaged `SystemGenome` child of the b
 `SystemGenome.derive()` — random search, evolutionary search, and Bayesian optimization all
 produce first-class genomes with mutation records, not opaque parameter dicts. Search happens only
 against the dataset's train split (`HoldoutGuard.search_set`); final candidate selection also
-checks the validation split; the holdout split is reserved for the promotion pipeline.
+checks the validation split; the holdout split is reserved for the promotion pipeline
+(`promotion/holdout.py`), which evaluates it once per candidate.
+
+Search is constraint-aware: a candidate's fitness is shrunk in proportion to how far it sits
+outside the safety limits and the quality floor (each tightened by a small search margin) and the
+promotion gates' cost/latency limits, and selection is feasible-first — a feasible candidate always beats
+an infeasible one regardless of raw fitness. Without this the optimizer happily converges on the
+boundary of (or outside) the limits, and the winner passes or fails the later checks on sampling
+noise alone.
 """
 
 from __future__ import annotations
@@ -30,8 +38,9 @@ from neuroforge.genomes.schema import MutationRecord, SystemGenome
 from neuroforge.mutations.policy import MutationPolicy
 from neuroforge.observability import get_tracer
 from neuroforge.optimization import Observation, SearchSpace, get_strategy
-from neuroforge.promotion.gates import PromotionGateConfig
-from neuroforge.promotion.safety import SafetyConstraints
+from neuroforge.promotion.gates import PromotionGateConfig, metric_gate_findings
+from neuroforge.promotion.holdout import per_challenge_metrics
+from neuroforge.promotion.safety import SafetyConstraints, SafetyEstimate, estimate_safety
 from neuroforge.providers.registry import get_provider
 from neuroforge.util import get_field_by_path
 
@@ -56,6 +65,20 @@ class ExperimentConfig(BaseModel):
     # is scored as a hard failure (fitness-worst) and the experiment continues — see
     # docs/development.md's failure-injection section and `make failure-evaluator-timeout`.
     evaluation_timeout_seconds: float | None = None
+    # Which dataset the experiment searches/validates against; None means the legacy convention
+    # `<application_id>-dataset`. Recorded so a later promotion review evaluates the holdout of
+    # the *same* dataset version this experiment used.
+    dataset_id: str | None = None
+    # Search aims this far inside the *safety* limits so the winner has headroom against
+    # split-to-split sampling noise (cost/latency/quality limits are near-deterministic functions
+    # of the configuration, so they need no such buffer).
+    search_safety_margin: float = Field(default=0.03, ge=0.0, le=0.2)
+    # Same idea for the quality floor: the optimum of a cost-weighted objective sits on the floor
+    # (cheaper is better right up to the limit), so without headroom the winner lands on it and
+    # passes or fails the holdout on noise.
+    search_quality_margin: float = Field(default=0.02, ge=0.0, le=0.2)
+    # Fitness is divided by (1 + constraint_penalty * violation): 0 disables shaping.
+    constraint_penalty: float = Field(default=10.0, ge=0.0)
 
 
 class ExperimentResult(BaseModel):
@@ -72,6 +95,11 @@ class ExperimentResult(BaseModel):
     budget_utilization: dict[str, float]
     fitness_history: list[float]
     recommendation: str
+    dataset_id: str = ""
+    dataset_version: int = 0
+    # Whether the selected genome cleared the margin-tightened constraints on the search split.
+    selected_feasible: bool = False
+    validation_safety: dict = Field(default_factory=dict)
 
 
 class ExperimentEngine:
@@ -140,9 +168,23 @@ class ExperimentEngine:
         budget_tracker = BudgetTracker.from_state(self.config.budget, ckpt.budget_state)
         best_genome = ckpt.best_genome_obj() or self.baseline_genome
         best_fitness = ckpt.best_fitness
+        best_feasible = ckpt.best_feasible
         next_version = self.baseline_genome.version + 1 + ckpt.candidates_completed()
         generation_index = ckpt.generations_completed()
         search_challenges = self.holdout_guard.search_set()
+        search_categories = [c.category for c in search_challenges]
+        baseline_search_agg = aggregate(
+            [self.domain.evaluate(self.baseline_genome, c, self.provider) for c in search_challenges],
+            search_categories,
+        )
+        search_gates = self.config.promotion_gates.model_copy(
+            update={
+                "min_quality": min(
+                    1.0, self.config.promotion_gates.min_quality + self.config.search_quality_margin
+                )
+            }
+        )
+        search_safety = self.config.safety_constraints.tightened(self.config.search_safety_margin)
 
         stop_reason = ""
         cancel_flag = self.state_dir / f"{self.config.experiment_id}.cancel"
@@ -213,8 +255,20 @@ class ExperimentEngine:
             ):
                 for genome, point in zip(genomes, points, strict=True):
                     results, timed_out = self._evaluate_candidate(genome, search_challenges)
-                    agg = aggregate(results, [c.category for c in search_challenges])
-                    fitness = 0.0 if timed_out else self.config.objectives.score(agg.as_dict())
+                    agg = aggregate(results, search_categories)
+                    violation = sum(
+                        f.magnitude
+                        for f in metric_gate_findings(
+                            baseline_search_agg, agg, search_gates, search_safety
+                        )
+                    )
+                    feasible = violation == 0.0 and not timed_out
+                    base_fitness = self.config.objectives.score(agg.as_dict())
+                    fitness = (
+                        0.0
+                        if timed_out
+                        else base_fitness / (1.0 + self.config.constraint_penalty * violation)
+                    )
                     observations.append(Observation(point=point, fitness=fitness))
                     fitness_values.append(fitness)
                     budget_tracker.record(
@@ -233,11 +287,14 @@ class ExperimentEngine:
                                 "fitness": fitness,
                                 "metrics": agg.as_dict(),
                                 "timed_out": timed_out,
+                                "feasible": feasible,
+                                "constraint_violation": round(violation, 6),
                             },
                         )
                     )
-                    if fitness > best_fitness:
+                    if (feasible, fitness) > (best_feasible, best_fitness):
                         best_fitness = fitness
+                        best_feasible = feasible
                         best_genome = genome
 
             strategy.tell(observations)
@@ -258,10 +315,14 @@ class ExperimentEngine:
             ckpt.budget_state = budget_tracker.to_state()
             ckpt.best_genome = best_genome.model_dump(mode="json")
             ckpt.best_fitness = best_fitness
+            ckpt.best_feasible = best_feasible
             ckpt.save(self.checkpoint_path)
 
+            # A plateau only means "done" once there is a feasible incumbent: while every
+            # candidate so far violates the limits, a flat fitness curve is the search still
+            # stuck outside the feasible region, not converged on an answer.
             convergence = strategy.convergence()
-            if convergence.converged:
+            if convergence.converged and best_feasible:
                 stop_reason = convergence.reason
                 break
 
@@ -272,7 +333,7 @@ class ExperimentEngine:
             Event("ExperimentStopped", self.config.experiment_id, {"reason": stop_reason})
         )
 
-        return self._finalize(ckpt, best_genome, budget_tracker)
+        return self._finalize(ckpt, best_genome, budget_tracker, best_feasible)
 
     def _evaluate_candidate(
         self, genome: SystemGenome, challenges: list[Challenge]
@@ -313,7 +374,11 @@ class ExperimentEngine:
             return worst, True
 
     def _finalize(
-        self, ckpt: ExperimentCheckpoint, best_genome: SystemGenome, budget_tracker: BudgetTracker
+        self,
+        ckpt: ExperimentCheckpoint,
+        best_genome: SystemGenome,
+        budget_tracker: BudgetTracker,
+        best_feasible: bool,
     ) -> ExperimentResult:
         val_challenges = self.holdout_guard.validation_set()
         baseline_results = [
@@ -334,12 +399,17 @@ class ExperimentEngine:
             confidence=self.config.confidence,
             seed=self.config.seed,
         )
+        safety = estimate_safety(
+            per_challenge_metrics(best_results),
+            confidence=self.config.confidence,
+            seed=self.config.seed,
+        )
 
         fitness_history = [
             f for batch in ckpt.tell_batches for f in batch.fitness
         ]
 
-        recommendation = self._recommend(comparison, best_agg)
+        recommendation = self._recommend(comparison, baseline_agg, best_agg, safety)
 
         return ExperimentResult(
             experiment_id=self.config.experiment_id,
@@ -355,16 +425,34 @@ class ExperimentEngine:
             budget_utilization=budget_tracker.utilization(),
             fitness_history=fitness_history,
             recommendation=recommendation,
+            dataset_id=self.dataset_version.dataset_id,
+            dataset_version=self.dataset_version.version,
+            selected_feasible=best_feasible,
+            validation_safety=safety.model_dump(mode="json"),
         )
 
-    def _recommend(self, comparison: ComparisonResult, best_agg: AggregateMetrics) -> str:
+    def _recommend(
+        self,
+        comparison: ComparisonResult,
+        baseline_agg: AggregateMetrics,
+        best_agg: AggregateMetrics,
+        safety: SafetyEstimate,
+    ) -> str:
         from neuroforge.evaluation.statistics import Conclusion
-        from neuroforge.promotion.safety import check_safety
 
-        safety_ok, violations = check_safety(best_agg.as_dict(), self.config.safety_constraints)
+        safety_ok, violations = safety.check(self.config.safety_constraints)
         if not safety_ok:
             return f"DO NOT PROMOTE — safety constraint violated: {'; '.join(violations)}"
         if comparison.conclusion == Conclusion.LIKELY_IMPROVEMENT:
+            findings = metric_gate_findings(
+                baseline_agg,
+                best_agg,
+                self.config.promotion_gates,
+                self.config.safety_constraints,
+                safety,
+            )
+            if findings:
+                return f"DO NOT PROMOTE — promotion gate not met: {'; '.join(f.reason for f in findings)}"
             return "PROMOTE TO CANARY — statistically significant improvement on validation set"
         if comparison.conclusion == Conclusion.LIKELY_REGRESSION:
             return "REJECT — candidate regressed relative to baseline"

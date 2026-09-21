@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from neuroforge.datasets.dataset import DatasetVersion
 from neuroforge.domains.base import ApplicationDomain, Challenge
 from neuroforge.evaluation.aggregate import AggregateMetrics, aggregate
 from neuroforge.genomes.schema import SystemGenome
@@ -23,6 +24,17 @@ class CanaryResult:
     n_candidate_requests: int
     rollback_triggered: bool
     reasons: list[str]
+
+
+def fresh_traffic(
+    domain: ApplicationDomain, dataset: DatasetVersion, n_requests: int, seed: int
+) -> list[Challenge]:
+    """Simulated live traffic: brand-new requests from the same generator and difficulty band as
+    the dataset but not members of it. A canary that replays dataset challenges re-tests the
+    candidate on data the search optimized against (train) or a promotion review already consumed
+    (validation/holdout); production traffic is, by definition, none of those."""
+    difficulties = [c.difficulty for c in dataset.challenges]
+    return domain.generate_cases(n_requests, (min(difficulties), max(difficulties)), seed)
 
 
 def simulate_canary(

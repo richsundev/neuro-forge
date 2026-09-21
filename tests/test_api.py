@@ -199,6 +199,7 @@ def test_promotion_finalize_requires_admin_approval_and_passed_canary(client):
 
     # Seed a deterministic approved decision and a passed canary directly, rather than relying on
     # this random-strategy experiment's own (uncertain) gate/canary outcome for a positive-path test.
+    from neuroforge.db.models import GenomeRecord
     from neuroforge.db.repository import save_canary_result, save_promotion_decision
     from neuroforge.db.session import session_scope
     from neuroforge.evaluation.aggregate import AggregateMetrics
@@ -212,6 +213,12 @@ def test_promotion_finalize_requires_admin_approval_and_passed_canary(client):
             "exp-finalize-test",
             GateDecision(approved=True, next_status=PromotionStatus.APPROVED, reasons=["ok"]),
         )
+
+    def genome_status() -> str:
+        with session_scope() as session:
+            return session.get(GenomeRecord, best_hash).status
+
+    assert genome_status() == "APPROVED"
 
     # Decision approved, but no canary yet.
     resp = c.post(
@@ -238,6 +245,8 @@ def test_promotion_finalize_requires_admin_approval_and_passed_canary(client):
             ),
         )
 
+    assert genome_status() == "ROLLED_BACK"
+
     # Decision approved, but the latest canary triggered a rollback.
     resp = c.post(
         "/api/v1/promotions/finalize",
@@ -262,6 +271,8 @@ def test_promotion_finalize_requires_admin_approval_and_passed_canary(client):
             ),
         )
 
+    assert genome_status() == "CANARY"
+
     # Viewer/operator keys cannot finalize even once the gates are satisfied — admin only.
     resp = c.post(
         "/api/v1/api-keys", json={"name": "ops", "role": "operator"}, headers=headers
@@ -283,6 +294,25 @@ def test_promotion_finalize_requires_admin_approval_and_passed_canary(client):
     body = resp.json()
     assert body["status"] == "PROMOTED"
     assert body["approved_by"] == "bootstrap-admin"
+    assert genome_status() == "PROMOTED"
+
+    # PROMOTED is terminal: a later canary or repeat review must not downgrade a live genome.
+    with session_scope() as session:
+        save_canary_result(
+            session,
+            best_hash,
+            "support-agent@v1",
+            CanaryResult(
+                baseline_metrics=agg,
+                candidate_metrics=agg,
+                traffic_split=0.1,
+                n_baseline_requests=9,
+                n_candidate_requests=1,
+                rollback_triggered=True,
+                reasons=["late rollback"],
+            ),
+        )
+    assert genome_status() == "PROMOTED"
 
     resp = c.get("/api/v1/promotions/approvals", headers=headers)
     assert resp.status_code == 200
@@ -306,3 +336,94 @@ def test_viewer_role_cannot_create_application(client):
         headers={"X-API-Key": viewer_key},
     )
     assert resp.status_code == 403
+
+
+def _create_and_run(c, headers, experiment_id: str, dataset_id: str, n: int, seed: int = 3) -> dict:
+    c.post(
+        "/api/v1/applications",
+        json={"id": "support-agent", "name": "Forge Support", "domain": "forge-support"},
+        headers=headers,
+    ).raise_for_status()
+    c.post(
+        "/api/v1/datasets",
+        json={"dataset_id": dataset_id, "domain": "forge-support", "n": n, "seed": seed},
+        headers=headers,
+    ).raise_for_status()
+    c.post(
+        "/api/v1/experiments",
+        json={
+            "experiment_id": experiment_id,
+            "system_id": "support-agent",
+            "dataset_id": dataset_id,
+            "strategy": "random",
+            "seed": seed,
+            "batch_size": 8,
+            "max_batches": 2,
+            "budget": {
+                "max_candidates": 16,
+                "max_requests": 100000,
+                "max_cost_usd": 100,
+                "max_duration_minutes": 30,
+            },
+        },
+        headers=headers,
+    ).raise_for_status()
+    resp = c.post(f"/api/v1/experiments/{experiment_id}/run", headers=headers)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def test_experiment_runs_against_the_dataset_it_was_created_with(client):
+    """Regression: `dataset_id` was accepted at creation but ignored at run time, which always used
+    `<application>-dataset` — so experiments silently ran on a different dataset than requested."""
+    c, admin_key = client
+    headers = {"X-API-Key": admin_key}
+    result = _create_and_run(c, headers, "exp-alt-dataset", "a-different-dataset", n=60)
+    assert result["dataset_id"] == "a-different-dataset"
+    assert result["dataset_version"] == 1
+
+    listed = next(e for e in c.get("/api/v1/experiments", headers=headers).json() if e["experiment_id"] == "exp-alt-dataset")
+    assert listed["dataset_id"] == "a-different-dataset"
+
+
+def test_promotion_review_measures_the_holdout_once_and_reuses_it(client):
+    from neuroforge.db.models import GenomeRecord, HoldoutEvaluationRecord
+    from neuroforge.db.session import session_scope
+
+    c, admin_key = client
+    headers = {"X-API-Key": admin_key}
+    result = _create_and_run(c, headers, "exp-holdout-once", "support-agent-dataset", n=120)
+    best_hash = next(e for e in c.get("/api/v1/experiments", headers=headers).json())["best_genome_hash"]
+
+    body = {"genome_hash": best_hash, "experiment_id": "exp-holdout-once"}
+    first = c.post("/api/v1/promotions", json=body, headers=headers)
+    second = c.post("/api/v1/promotions", json=body, headers=headers)
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    assert first.json()["evidence"][0].startswith("holdout split of support-agent-dataset v1")
+
+    with session_scope() as session:
+        rows = session.query(HoldoutEvaluationRecord).filter_by(genome_hash=best_hash).all()
+        status = session.get(GenomeRecord, best_hash).status
+    assert len(rows) == 1
+    assert rows[0].evidence["dataset_version"] == result["dataset_version"]
+    assert status == ("APPROVED" if first.json()["approved"] else "REJECTED")
+
+    # The Evolution Graph reads statuses through the lineage endpoint: it must show the pipeline's
+    # current state, not the snapshot taken when the genome was first saved.
+    lineage = c.get("/api/v1/genomes/support-agent/lineage", headers=headers).json()
+    node = next(n for n in lineage["nodes"] if n["hash"] == best_hash)
+    assert node["status"] == status
+
+    recorded = c.get("/api/v1/promotions", headers=headers).json()
+    assert all(p["evidence"] for p in recorded)
+
+
+def test_promotion_request_without_a_finished_experiment_is_a_client_error(client):
+    c, admin_key = client
+    resp = c.post(
+        "/api/v1/promotions",
+        json={"genome_hash": "0" * 16, "experiment_id": "does-not-exist"},
+        headers={"X-API-Key": admin_key},
+    )
+    assert resp.status_code == 400

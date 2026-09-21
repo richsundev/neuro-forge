@@ -21,8 +21,9 @@ export default function GenomeLineagePage() {
       <div>
         <h1 className="text-xl font-semibold">Evolution Graph — {params.systemId}</h1>
         <p className="text-sm text-slate-500">
-          Every genome NeuroForge ever produced for this application, and the mutation lineage
-          connecting them. Click a node to inspect its configuration and promotion status.
+          The baseline and each experiment&rsquo;s selected winner for this application, with the
+          mutation lineage connecting them. Node color is the genome&rsquo;s current promotion
+          status; click a node to inspect it.
         </p>
       </div>
       {error && <div className="card text-sm text-bad">{error}</div>}

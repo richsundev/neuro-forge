@@ -44,6 +44,7 @@ export interface ApplicationSummary {
 export interface ExperimentSummary {
   experiment_id: string;
   application_id: string;
+  dataset_id: string;
   domain: string;
   strategy: string;
   status: string;
@@ -122,6 +123,7 @@ export interface PromotionDecision {
   approved: boolean;
   next_status: string;
   reasons: string[];
+  evidence: string[];
 }
 
 export interface PromotionRecord {
@@ -130,6 +132,7 @@ export interface PromotionRecord {
   approved: boolean;
   next_status: string;
   reasons: string[];
+  evidence: string[];
   created_at: string;
 }
 

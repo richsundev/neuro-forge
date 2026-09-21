@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import Literal
 
 import numpy as np
 
@@ -51,6 +52,26 @@ def bootstrap_ci(
     alpha = 1 - confidence
     lo, hi = np.quantile(means, [alpha / 2, 1 - alpha / 2])
     return float(lo), float(hi)
+
+
+def bootstrap_mean_bound(
+    values: list[float],
+    *,
+    side: Literal["upper", "lower"],
+    confidence: float = 0.95,
+    n_resamples: int = 2000,
+    seed: int = 0,
+) -> float:
+    """One-sided percentile-bootstrap bound on the mean: with `confidence` probability the true
+    mean is <= the "upper" bound (or >= the "lower" bound). This is what turns a safety *point
+    estimate* on a few dozen challenges into a claim you can actually defend."""
+    if not values:
+        raise ValueError("cannot bound the mean of zero values")
+    arr = np.asarray(values, dtype=float)
+    rng = np.random.default_rng(seed)
+    means = rng.choice(arr, size=(n_resamples, len(arr)), replace=True).mean(axis=1)
+    q = confidence if side == "upper" else 1.0 - confidence
+    return float(np.quantile(means, q))
 
 
 def compare(

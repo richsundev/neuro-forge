@@ -11,7 +11,7 @@ GENERATED -> VALIDATED -> BENCHMARKED -> HOLDOUT_TESTED -> APPROVED -> CANARY ->
 `genomes/schema.py:PromotionStatus` and `promotion/gates.py:PROMOTION_ORDER`/`next_allowed_status`
 define the sequence; a genome's `status` field is one of these values. Nothing in this codebase
 auto-advances a genome through every stage — each stage requires an explicit call
-(`neuroforge promotion request`, `neuroforge canary run`), matching section 69's core distinction:
+(`neuroforge promotion request`, `neuroforge canary run`, `neuroforge promotion promote`), matching section 69's core distinction:
 **autonomous discovery, not autonomous deployment.**
 
 ## The human-approval gate (APPROVED/CANARY → PROMOTED)
@@ -31,11 +31,28 @@ its own but cannot itself take a candidate live. The action is logged to `promot
 dashboard's `/promotions` page surfaces this as a "Promote to production" button that stays
 disabled (with a tooltip explaining why) until both conditions above are met.
 
+## Promotion review: what the decision is based on
+
+`POST /api/v1/promotions` / `neuroforge promotion request` run `promotion/review.py:
+review_promotion`, which is the only place a promotion decision is made:
+
+1. The candidate and the experiment's baseline are measured on the dataset's **holdout split** —
+   the split neither the search (train) nor the experiment's own recommendation (validation) ever
+   used — through `HoldoutGuard.evaluate_holdout`. The dataset is the one the experiment actually
+   ran against (`ExperimentResult.dataset_id` / `dataset_version`).
+2. That measurement is **persisted once** per (genome, dataset version) in `holdout_evaluations`.
+   A repeat request reuses it rather than re-measuring, so the holdout can't be re-rolled to chase a
+   better number (ADR-0007, ADR-0014).
+3. The gates and safety limits **from the experiment's own config** are applied to it, and the
+   decision is stored with the evidence that produced it (`promotion_decisions.evidence`).
+
 ## Promotion gates
 
-`promotion/gates.py:evaluate_promotion()` checks, in order:
+`promotion/gates.py:evaluate_promotion()` applies, in order:
 
-1. Hard safety constraints (see docs/safety.md) — short-circuits on failure.
+1. Hard safety constraints (see docs/safety.md), checked at **95% confidence bounds** on the holdout
+   split — the policy-violation rate's upper bound must be under its limit, the safety score's
+   lower bound above its floor.
 2. `min_quality` — absolute floor, independent of the baseline.
 3. `max_cost_increase` / `max_latency_increase` — fractional caps vs. baseline.
 4. Statistical significance — `comparison.conclusion == LIKELY_IMPROVEMENT` required by default
@@ -45,30 +62,58 @@ disabled (with a tooltip explaining why) until both conditions above are met.
    (more than 2x the configured caps) is rejected even if it technically cleared gates 2–3
    individually.
 
-The result is a `PromotionDecision` with `approved: bool` and a list of human-readable `reasons` —
-every rejection states exactly which gate failed and by how much, e.g.
-`"policy_violation_rate 0.204 > allowed maximum 0.200"`.
+The result is a `PromotionDecision` with `approved`, human-readable `reasons` (every rejection
+states exactly which gate failed and by how much, e.g. `"quality 0.6196 below minimum 0.6200"`) and
+`evidence` (the holdout sample size, the quality comparison, cost/latency deltas, and the safety
+bounds). Checks 1–3 live in `metric_gate_findings`, which the experiment engine also uses while
+searching — see below.
+
+## Search and promotion share the same limits
+
+`ExperimentEngine` doesn't just maximize fitness and hope: each candidate's fitness is divided by
+`1 + constraint_penalty × violation`, where violation is how far it sits outside the safety limits,
+the quality floor and the cost/latency gates (the same `metric_gate_findings` promotion uses), and
+selection is **feasible-first** — a candidate inside all limits always beats one outside them.
+The safety limits and quality floor are tightened by a small search margin (`search_safety_margin`
+0.03, `search_quality_margin` 0.02) because a cost-weighted objective's optimum sits *on* a floor,
+and a winner on the boundary passes or fails the holdout on noise. A fitness plateau isn't treated
+as convergence until a feasible candidate exists. Measured on ForgeSupport (300-challenge dataset,
+240 candidates, 10 seeds): 8 seeds found a feasible winner and all 8 were approved on the holdout;
+the other 2 didn't and were correctly reported as `DO NOT PROMOTE` with the violated limit.
 
 ## Why the gates are calibrated the way they are
 
-The defaults (`min_quality=0.62`, `max_policy_violation_rate=0.20`) are calibrated against what
-ForgeSupport's deterministic scoring model can actually achieve with a fully-optimized genome
-(~0.72–0.79 quality ceiling given the mock provider's capability range and the deliberately
-imperfect starting baseline) — set high enough that the naive v1 baseline fails every gate, low
-enough that a genuinely improved candidate can clear them. This is the same calibration exercise a
-real team does against their own system's achievable range; the numbers are not arbitrary and are
-not tuned to force a particular demo outcome — several `scripts/reproduce.py` runs across
-different seeds land on both `PROMOTE TO CANARY` and `DO NOT PROMOTE` depending on what the search
-actually finds.
+`python scripts/calibrate_gates.py` samples the search space, evaluates each configuration on the
+whole dataset, and reports how much of the space clears each limit and how much clears all of them:
+
+```
+gate                                   limit  cleared by   best reachable
+quality >= min_quality                  0.62       53.5%            0.782
+policy violation <= max                 0.28       10.5%            0.216
+safety_score >= min                     0.85       97.8%            0.939
+cost increase <= max                    +10%       44.0%             -80%
+latency increase <= max                 +15%       54.0%             -75%
+
+clears ALL gates simultaneously: 8/400
+```
+
+The baseline fails the quality and policy-violation gates; ~2% of the space clears everything, so
+the limits discriminate without being unsatisfiable. That last property is enforced by a test
+(`test_default_gates_are_reachable_in_forge_support`). The policy-violation limit was originally
+0.20, which no ForgeSupport configuration can meet (the floor is 0.216) — see ADR-0014 for what that
+did to earlier "PROMOTE" verdicts. The numbers are properties of ForgeSupport's simulated scoring
+model; a different domain must be calibrated the same way.
 
 ## Canary simulation
 
-`promotion/canary.py:simulate_canary()` routes deterministic mock traffic between baseline and
-candidate (`candidate_traffic_fraction`, default 10%) via a stable per-challenge hash — so the
-same dataset always splits the same way — evaluates both arms independently, and flags
-`rollback_triggered` if the candidate's canary-slice safety/quality looks worse than the baseline's
-by more than the configured thresholds. This is a second, independent check after search-time
-evaluation and the promotion gates, not a rerun of the same evaluation.
+`promotion/canary.py:simulate_canary()` routes traffic between baseline and candidate
+(`candidate_traffic_fraction`, default 10%) via a stable per-request hash, evaluates both arms
+independently, and flags `rollback_triggered` if the candidate's canary-slice safety/quality looks
+worse than the configured thresholds. The traffic is **fresh** (`fresh_traffic`): newly generated
+requests from the dataset's generator and difficulty band, disjoint from train, validation and
+holdout — a canary that replayed dataset challenges would re-test the candidate on data it was
+optimized against. The canary's candidate arm is small (~20 requests at the defaults), so it is a
+point-estimate smoke test on a live slice, not a substitute for the holdout's confidence bounds.
 
 ## What a real deployment adds
 
