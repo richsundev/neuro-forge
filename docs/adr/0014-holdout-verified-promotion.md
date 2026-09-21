@@ -65,7 +65,7 @@ The holdout is ~15–25% of the dataset, so its bounds are wide (n=50 here); a p
 tighter claims needs a larger dataset (the default seed size went from 100 to 300 for this reason).
 The 0.28 limit is a property of ForgeSupport's simulated scoring model, not a universal number — a
 new domain must be calibrated the same way. The constraint-aware search can still fail to find a
-feasible winner within budget (2 of 10 seeds at 240 candidates); it then reports
+feasible winner within budget (2 of 10 seeds at 240 candidates; one of those two still cleared the holdout); it then reports
 `DO NOT PROMOTE` with the violated limit rather than promoting the least-bad candidate.
 
 ## Consequences

@@ -98,9 +98,14 @@ export default function OverviewPage() {
       <section className="card">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-base font-semibold">Experiments</h2>
-          <button onClick={load} className="text-xs text-accent hover:underline">
-            refresh
-          </button>
+          <div className="flex items-center gap-3">
+            <button onClick={load} className="text-xs text-accent hover:underline">
+              refresh
+            </button>
+            <Link href="/experiments/new" className="rounded-md bg-accent px-3 py-1 text-xs font-medium text-white hover:opacity-90">
+              New experiment
+            </Link>
+          </div>
         </div>
         {experiments.length === 0 ? (
           <p className="text-sm text-slate-500">No experiments yet.</p>

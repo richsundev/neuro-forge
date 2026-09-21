@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 import time
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated
@@ -43,17 +45,22 @@ from neuroforge.db.repository import (
     upsert_application,
 )
 from neuroforge.db.session import init_db, session_scope
-from neuroforge.domains import get_domain
+from neuroforge.domains import DOMAIN_REGISTRY, get_domain
 from neuroforge.evaluation.aggregate import aggregate
 from neuroforge.evaluation.pareto import ParetoPoint, pareto_frontier
 from neuroforge.evaluation.statistics import ComparisonResult, compare
 from neuroforge.experiments.budget import ExperimentBudget
 from neuroforge.experiments.checkpoint import ExperimentCheckpoint
+from neuroforge.experiments.configure import (
+    ConfigError,
+    build_objectives,
+    build_search_space,
+    describe_domain,
+)
 from neuroforge.experiments.engine import ExperimentAlreadyRunning, ExperimentConfig
 from neuroforge.experiments.events import EventLog
 from neuroforge.experiments.queue import enqueue_experiment
 from neuroforge.experiments.runner import RunnerError, UnknownExperiment, run_recorded_experiment
-from neuroforge.experiments.spaces import search_space_for_domain
 from neuroforge.genomes.lineage import GenomeStore
 from neuroforge.genomes.schema import PromotionStatus, SystemGenome
 from neuroforge.observability import configure_tracing, get_tracer
@@ -121,6 +128,7 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     if key:
         logger.warning("Bootstrap admin API key created (store it now, shown only once): %s", key)
     yield
+    _RUN_POOL.shutdown(wait=False, cancel_futures=True)
 
 
 app = FastAPI(title="NeuroForge API", version="1.0.0", description=__doc__, lifespan=_lifespan)
@@ -257,6 +265,16 @@ def _best_genome_hash(result: dict | None) -> str | None:
     if not result or not result.get("best_genome"):
         return None
     return SystemGenome.model_validate(result["best_genome"]).hash()
+
+
+# --- domains -----------------------------------------------------------
+
+
+@app.get("/api/v1/domains", tags=["domains"])
+def list_domains(principal: Principal = Depends(require_role("viewer"))) -> list[dict]:
+    """What each domain offers an experiment: the search dimensions (grouped by genome section), the
+    default objective weights, and the default promotion gates and safety limits."""
+    return [describe_domain(name) for name in sorted(DOMAIN_REGISTRY)]
 
 
 # --- applications ------------------------------------------------------
@@ -437,6 +455,11 @@ def _create_experiment(body: ExperimentCreateRequest, principal: Principal) -> d
             dataset = seed_dataset(domain, dataset_id, n=DEFAULT_DATASET_SIZE, seed=body.seed)
             save_dataset_version(session, dataset)
 
+        try:
+            search_space = build_search_space(body.domain, body.search_dimensions)
+            objectives = build_objectives(body.objective_weights)
+        except ConfigError as exc:
+            raise HTTPException(400, str(exc)) from exc
         overrides: dict = {}
         if body.promotion_gates is not None:
             overrides["promotion_gates"] = body.promotion_gates
@@ -450,7 +473,8 @@ def _create_experiment(body: ExperimentCreateRequest, principal: Principal) -> d
             **overrides,
             first_candidate_version=next_candidate_version(session, body.system_id),
             search_strategy=body.strategy,
-            search_space=search_space_for_domain(body.domain),
+            search_space=search_space,
+            objectives=objectives,
             batch_size=body.batch_size,
             max_batches=body.max_batches,
             seed=body.seed,
@@ -521,6 +545,55 @@ def run_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = 
         raise HTTPException(409, str(exc)) from exc
     audit(principal.name, "run_experiment", {"experiment_id": experiment_id, "status": result.status})
     return result.model_dump(mode="json")
+
+
+# Runs started through the API execute on a small in-process pool so a client (the dashboard) can start
+# an experiment and poll its progress instead of holding a request open. It is for single-process and
+# demo deployments; a production deployment enqueues to the Redis worker instead (`/enqueue`).
+_RUN_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="nf-experiment")
+_ACTIVE_RUNS: set[str] = set()
+_ACTIVE_LOCK = threading.Lock()
+_MAX_ACTIVE_RUNS = 6
+
+
+def _run_in_background(experiment_id: str) -> None:
+    try:
+        run_recorded_experiment(experiment_id, _state_dir())
+    except ExperimentAlreadyRunning:
+        logger.warning("experiment %s is already running elsewhere", experiment_id)
+    except Exception:
+        # The runner has already recorded the experiment as failed; nothing to re-raise into.
+        logger.exception("background run of experiment %s failed", experiment_id)
+    finally:
+        with _ACTIVE_LOCK:
+            _ACTIVE_RUNS.discard(experiment_id)
+
+
+@app.post("/api/v1/experiments/{experiment_id}/start", tags=["experiments"], status_code=202)
+def start_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = Depends(require_role("operator"))) -> dict:
+    """Start an experiment in the background and return immediately; follow it with
+    `GET /experiments/{id}`, `/checkpoint` and `/candidates`."""
+    with _ACTIVE_LOCK:
+        if experiment_id in _ACTIVE_RUNS:
+            raise HTTPException(409, f"experiment '{experiment_id}' is already running")
+        if len(_ACTIVE_RUNS) >= _MAX_ACTIVE_RUNS:
+            raise HTTPException(429, "too many experiments are running; try again shortly")
+        _ACTIVE_RUNS.add(experiment_id)
+    try:
+        with session_scope() as session:
+            record = get_experiment(session, experiment_id)
+            if record is None:
+                raise HTTPException(404, f"unknown experiment '{experiment_id}'")
+            if record.status in ("running", "queued"):
+                raise HTTPException(409, f"experiment '{experiment_id}' is already {record.status}")
+            save_experiment(session, record.application_id, ExperimentConfig.model_validate(record.config), status="queued")
+        _RUN_POOL.submit(_run_in_background, experiment_id)
+    except BaseException:
+        with _ACTIVE_LOCK:
+            _ACTIVE_RUNS.discard(experiment_id)
+        raise
+    audit(principal.name, "start_experiment", {"experiment_id": experiment_id})
+    return {"started": True, "status": "queued"}
 
 
 @app.post("/api/v1/experiments/{experiment_id}/cancel", tags=["experiments"])

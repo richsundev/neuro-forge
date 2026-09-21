@@ -250,6 +250,15 @@ class ExperimentEngine:
             [self.domain.evaluate(self.baseline_genome, c, self.provider) for c in search_challenges],
             search_categories,
         )
+        # Cost and latency are scored *relative to the baseline*: the baseline sits at 0.5 and a genome
+        # that halves the cost approaches 0.75. The old fixed scales (a $0.05 request, a 3s latency)
+        # were 40x the baseline's actual cost here, so a genome 3x cheaper gained 0.0008 fitness while
+        # +0.05 quality gained 0.0125 — the cost weight was decorative and could not be tuned.
+        objective_scales = {
+            "cost_usd": max(2.0 * baseline_search_agg.cost_usd, 1e-9),
+            "latency_ms": max(2.0 * baseline_search_agg.latency_ms, 1e-6),
+            "failure_rate": 1.0,
+        }
         search_gates = self.config.promotion_gates.model_copy(
             update={
                 "min_quality": min(
@@ -345,7 +354,7 @@ class ExperimentEngine:
                         )
                     )
                     feasible = violation == 0.0 and not timed_out
-                    base_fitness = self.config.objectives.score(agg.as_dict())
+                    base_fitness = self.config.objectives.score(agg.as_dict(), objective_scales)
                     fitness = (
                         0.0
                         if timed_out

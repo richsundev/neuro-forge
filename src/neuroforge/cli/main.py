@@ -34,12 +34,18 @@ from neuroforge.domains import get_domain
 from neuroforge.evaluation.aggregate import aggregate
 from neuroforge.evaluation.statistics import compare
 from neuroforge.experiments.checkpoint import ExperimentCheckpoint
+from neuroforge.experiments.configure import (
+    ConfigError,
+    build_objectives,
+    build_search_space,
+    parse_weight_options,
+)
 from neuroforge.experiments.engine import ExperimentAlreadyRunning, ExperimentConfig
 from neuroforge.experiments.runner import RunnerError, UnknownExperiment, run_recorded_experiment
-from neuroforge.experiments.spaces import search_space_for_domain
 from neuroforge.genomes.schema import PromotionStatus, SystemGenome
 from neuroforge.optimization import STRATEGY_REGISTRY
 from neuroforge.promotion.canary import fresh_traffic, simulate_canary
+from neuroforge.promotion.gates import PromotionGateConfig
 from neuroforge.promotion.lifecycle import (
     ProductionError,
     current_champion,
@@ -50,6 +56,7 @@ from neuroforge.promotion.lifecycle import (
     system_of_genome,
 )
 from neuroforge.promotion.review import ReviewError, review_promotion
+from neuroforge.promotion.safety import SafetyConstraints
 from neuroforge.providers.registry import get_provider
 from neuroforge.util import stable_int
 
@@ -230,6 +237,18 @@ def experiment_create(
         help='what to evolve from: "champion" (current production genome, else the original), '
         '"original" (v1), or a genome hash / <system>@v<N>',
     ),
+    focus: Annotated[
+        list[str] | None,
+        typer.Option(help="search only these genome sections/fields, e.g. prompt or retrieval.top_k (repeatable)"),
+    ] = None,
+    weight: Annotated[
+        list[str] | None,
+        typer.Option(help="pin an objective's share of the total, metric=value, e.g. cost_usd=0.4 (repeatable)"),
+    ] = None,
+    min_quality: Annotated[float | None, typer.Option(help="promotion gate: absolute quality floor")] = None,
+    max_cost_increase: Annotated[float | None, typer.Option(help="promotion gate: fractional cost cap vs. baseline, 0.1 = +10%")] = None,
+    max_latency_increase: Annotated[float | None, typer.Option(help="promotion gate: fractional latency cap vs. baseline")] = None,
+    max_policy_violation: Annotated[float | None, typer.Option(help="safety limit on the policy-violation rate")] = None,
 ) -> None:
     dataset_id = dataset_id or f"{system_id}-dataset"
     d = _domain_or_error(domain)
@@ -255,6 +274,26 @@ def experiment_create(
 
         from neuroforge.experiments.budget import ExperimentBudget
 
+        try:
+            search_space = build_search_space(domain, focus)
+            objectives = build_objectives(parse_weight_options(weight))
+        except ConfigError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        gate_overrides = {
+            k: v
+            for k, v in {
+                "min_quality": min_quality,
+                "max_cost_increase": max_cost_increase,
+                "max_latency_increase": max_latency_increase,
+            }.items()
+            if v is not None
+        }
+        extra: dict = {}
+        if gate_overrides:
+            extra["promotion_gates"] = PromotionGateConfig(**gate_overrides)
+        if max_policy_violation is not None:
+            extra["safety_constraints"] = SafetyConstraints(max_policy_violation_rate=max_policy_violation)
+
         config = ExperimentConfig(
             experiment_id=experiment_id,
             domain_name=domain,
@@ -262,7 +301,9 @@ def experiment_create(
             baseline_hash=baseline_record.hash,
             first_candidate_version=next_candidate_version(session, system_id),
             search_strategy=strategy,
-            search_space=search_space_for_domain(domain),
+            search_space=search_space,
+            objectives=objectives,
+            **extra,
             batch_size=batch_size,
             max_batches=max_batches,
             seed=seed,

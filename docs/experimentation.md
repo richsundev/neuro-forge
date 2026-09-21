@@ -29,6 +29,17 @@ a feasible candidate exists. Each `CandidateEvaluated` event records `feasible` 
 `constraint_violation`; `ExperimentResult.selected_feasible` records whether the winner made it.
 Rationale and measurements: ADR-0014.
 
+## What the search may change, and what it optimizes
+
+`search_dimensions` restricts the search space to whole sections (`prompt`) or single fields
+(`retrieval.top_k`); anything not listed stays at the baseline's value. `objective_weights` pins
+an objective's share of the total (`{"cost_usd": 0.4}`); the others split the rest in their default
+proportions. Cost and latency are scored relative to the baseline (the baseline scores 0.5, half the
+cost approaches 0.75), so a weight means the same thing whatever the absolute prices are. The CLI
+takes `--focus`, `--weight` and the gate options; `GET /domains` lists the dimensions a domain has.
+`POST /experiments/{id}/start` runs one in the background (202) and `GET /experiments/{id}/checkpoint`
+reports live progress; production deployments use `/enqueue` instead. Rationale: ADR-0016.
+
 ## Which baseline
 
 `ExperimentConfig.baseline_hash` records the genome the search evolves from, resolved once at

@@ -85,11 +85,50 @@ export interface ExperimentSummary {
   comparison_summary: string | null;
 }
 
+export interface ExperimentConfigView {
+  search_strategy: string;
+  batch_size: number;
+  seed: number;
+  baseline_hash: string | null;
+  budget: { max_candidates: number; max_requests: number; max_cost_usd: number; max_duration_minutes: number };
+  search_space: { parameters: Record<string, unknown> };
+  objectives: { objectives: Record<string, { direction: string; weight: number }> };
+  promotion_gates: { min_quality: number; max_cost_increase: number; max_latency_increase: number };
+  safety_constraints: { min_safety_score: number; max_policy_violation_rate: number };
+}
+
 export interface ExperimentDetail {
   experiment_id: string;
   status: string;
-  config: Record<string, unknown>;
+  config: ExperimentConfigView;
   result: ExperimentResult | null;
+}
+
+/** `GET /experiments/{id}/checkpoint` — the live view of a running experiment. */
+export interface ExperimentProgress {
+  status: string;
+  stop_reason: string;
+  generations_completed: number;
+  candidates_completed: number;
+  best_fitness: number | null;
+  fitness_history: number[];
+}
+
+export interface SearchDimension {
+  path: string;
+  type: string;
+  values?: unknown[];
+  min?: number;
+  max?: number;
+}
+
+export interface DomainInfo {
+  name: string;
+  /** Genome section -> the fields the search may turn in it. */
+  search_dimensions: Record<string, SearchDimension[]>;
+  objectives: Record<string, { direction: string; weight: number }>;
+  promotion_gates: { min_quality: number; max_cost_increase: number; max_latency_increase: number };
+  safety_constraints: { min_safety_score: number; max_policy_violation_rate: number };
 }
 
 export interface ComparisonResult {

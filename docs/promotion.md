@@ -108,8 +108,9 @@ The safety limits and quality floor are tightened by a small search margin (`sea
 0.03, `search_quality_margin` 0.02) because a cost-weighted objective's optimum sits *on* a floor,
 and a winner on the boundary passes or fails the holdout on noise. A fitness plateau isn't treated
 as convergence until a feasible candidate exists. Measured on ForgeSupport (300-challenge dataset,
-240 candidates, 10 seeds): 8 seeds found a feasible winner and all 8 were approved on the holdout;
-the other 2 didn't and were correctly reported as `DO NOT PROMOTE` with the violated limit.
+240 candidates, 10 seeds): 8 seeds found a feasible winner on the search split and 9 were approved on the holdout
+(one search-infeasible winner still cleared it); the other seed was correctly reported as
+`DO NOT PROMOTE` with the violated limit (policy-violation upper bound 0.304 against 0.28).
 
 ## Why the gates are calibrated the way they are
 

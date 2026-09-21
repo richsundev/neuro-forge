@@ -17,7 +17,7 @@ mock provider, SQLite. Reproduce with the snippets below; nothing here is invent
 ## What this means in practice
 
 Evaluation against the mock provider, not the optimizer bookkeeping, is the bottleneck — the
-`scripts/reproduce.py` main experiment (168 candidates against a 205-challenge train split, plus
+`scripts/reproduce.py` main experiment (216 candidates against a 205-challenge train split, plus
 the baseline and the validation/holdout passes) evaluates ~35,000 (genome, challenge) pairs and
 completes in about 3 seconds. A real LLM provider would make evaluation the bottleneck by orders of
 magnitude (network latency per request, not microseconds), which is exactly why the mock provider

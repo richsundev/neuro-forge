@@ -25,36 +25,36 @@ Autonomous *experimentation*, never autonomous *deployment* — see [ADR-0013](d
 
 `ForgeSupport`, the demo customer-support agent NeuroForge evolves, starts with a naive baseline
 (direct prompting, greedy tool selection, no reranking). One constraint-aware evolutionary-search
-experiment later (168 real candidate genomes evaluated before the fitness curve plateaued, ~3
+experiment later (216 real candidate genomes evaluated before the fitness curve plateaued, ~3
 seconds wall-clock against the deterministic mock provider):
 
 | metric | baseline (v1) | best candidate found | change |
 |---|---|---|---|
-| quality | 0.512 | 0.650 | **+27.0%** |
-| policy_compliance | 0.403 | 0.754 | **+87.0%** |
-| tool_success | 0.351 | 0.647 | **+84.5%** |
-| task_success | 0.471 | 0.684 | +45.1% |
+| quality | 0.512 | 0.653 | **+27.5%** |
+| policy_compliance | 0.403 | 0.779 | **+93.2%** |
+| tool_success | 0.351 | 0.647 | **+84.4%** |
+| task_success | 0.471 | 0.685 | +45.4% |
 | safety_score | 0.868 | 0.940 | +8.3% |
-| cost / request | $0.0012 | $0.0004 | **−62.9%** |
-| latency | 769ms | 362ms | **−52.9%** |
+| cost / request | $0.0012 | $0.0004 | **−64.2%** |
+| latency | 769ms | 335ms | **−56.4%** |
 | failure_rate | 60.0% | 0.0% | **−100%** |
 
 Statistical comparison (paired bootstrap on the validation split, never the search split):
-**+27.0% (95% CI [+21.5%, +32.5%]) → `LIKELY_IMPROVEMENT`**, recommendation **`PROMOTE TO CANARY`**.
+**+27.5% (95% CI [+22.0%, +32.9%]) → `LIKELY_IMPROVEMENT`**, recommendation **`PROMOTE TO CANARY`**.
 
 That is the experiment's own view. The promotion decision is made separately, on the **holdout
 split** that neither the search nor the validation ever touched, with safety checked at 95%
 confidence bounds rather than as a point estimate:
 
-> holdout n=50 — quality **+27.6% (95% CI [+22.4%, +32.8%])**, cost −63.0% (limit +10%), latency
-> −53.5% (limit +15%), safety_score 0.940 (lower bound 0.934 ≥ 0.85), policy_violation_rate 0.246
-> (**upper bound 0.267 ≤ 0.28**) → **APPROVED**
+> holdout n=50 — quality **+28.2% (95% CI [+23.1%, +33.3%])**, cost −64.2% (limit +10%), latency
+> −56.3% (limit +15%), safety_score 0.940 (lower bound 0.934 ≥ 0.85), policy_violation_rate 0.221
+> (**upper bound 0.242 ≤ 0.28**) → **APPROVED**
 
 The search is constraint-aware, so the winner is chosen from candidates that sit inside the safety,
 quality, cost and latency limits — with headroom, not on the boundary — rather than being the
 highest-fitness candidate that then passes or fails the later checks on noise. Across 10 seeds at
-this budget, 8 searches found a within-limits winner and all 8 were approved on the holdout; the
-other 2 didn't, and were reported as `DO NOT PROMOTE` with the specific limit they missed. The
+this budget, 8 searches found a within-limits winner on the search split and 9 were approved on the
+holdout; the other one was reported as `DO NOT PROMOTE` with the specific limit it missed. The
 recommendation is evidence-driven, not scripted to always look good — see
 [docs/promotion.md](docs/promotion.md) and [ADR-0014](docs/adr/0014-holdout-verified-promotion.md).
 
@@ -69,6 +69,17 @@ python scripts/calibrate_gates.py   # how much of the search space clears each g
 ---
 
 ## Screenshots
+
+**New experiment** — choose what to evolve from (the champion by default), which parts of the system
+the search may change, what to optimize for and the promotion gates, then start it. Nothing here is
+dashboard-only: the same controls are on the API and the CLI ([ADR-0016](docs/adr/0016-configurable-operable-experiments.md)):
+
+![New experiment](docs/images/new-experiment.png)
+
+**Live progress** — the running experiment shows the configuration it is actually using and its
+fitness as candidates are evaluated:
+
+![Experiment running](docs/images/experiment-live.png)
 
 **Evolution Graph** — the baseline and each experiment's selected winner, colored by their real promotion status (here: one promoted, one approved, one rejected):
 
@@ -156,9 +167,11 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 | Promotion page (candidates, canary, history) — drives promotion/canary from the UI, not just CLI | ✅ | dashboard `/promotions` |
 | Human-approval gate before PROMOTED (admin-role only, attributed and logged) | ✅ | `POST /api/v1/promotions/finalize`, `promotion_approvals` |
 | Champion/challenger loop: experiments evolve from production, promotion supersedes, admin rollback, stale-baseline refusal | ✅ | `promotion/lifecycle.py`, [ADR-0015](docs/adr/0015-champion-challenger-lifecycle.md) |
+| Configurable experiments: pick search dimensions, objective weights and gates; cost/latency scored relative to the baseline | ✅ | `experiments/configure.py`, [ADR-0016](docs/adr/0016-configurable-operable-experiments.md) |
+| Launch and follow experiments from the dashboard (background start, live progress) | ✅ | dashboard `/experiments/new`, `POST /experiments/{id}/start` |
 | 3 domain plugins (support/SQL/research agent) | ✅ | `domains/` |
 | Deterministic mock provider + real provider adapters | ✅ | `providers/` |
-| REST API (27 endpoints, OpenAPI, auth, rate limiting) | ✅ | `apps/api/` |
+| REST API (29 endpoints, OpenAPI, auth, rate limiting) | ✅ | `apps/api/` |
 | CLI (Typer) | ✅ | `neuroforge` / `src/neuroforge/cli/` |
 | Async worker via Redis queue | ✅ | `scripts/worker.py`, [ADR-0010](docs/adr/0010-redis-queue-not-celery.md) |
 | Docker Compose (6 services, verified working) | ✅ | `docker-compose.yml` |
@@ -167,7 +180,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 | OpenTelemetry tracing (per-request, per-generation spans) | ✅ | `src/neuroforge/observability.py` |
 | Failure injection (6 scenarios, all pass) | ✅ | `make failure-all` |
 | CI (test/lint/typecheck/build/security) | ✅ | `.github/workflows/` |
-| 15 ADRs | ✅ | `docs/adr/` |
+| 16 ADRs | ✅ | `docs/adr/` |
 | Reproducible research mode | ✅ | `make reproduce` |
 
 ## Technology stack
@@ -175,7 +188,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 **Backend**: Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0, Alembic, PostgreSQL (SQLite for
 local/CI), Redis, NumPy/SciPy. **Frontend**: Next.js 14 (App Router), TypeScript (strict),
 Tailwind CSS, Recharts. **Infra**: Docker Compose, Kubernetes, GitHub Actions. **Testing**:
-pytest (148 tests), mypy (strict), Ruff, ESLint, tsc.
+pytest (158 tests), mypy (strict), Ruff, ESLint, tsc.
 
 ## Quick start
 
@@ -190,7 +203,7 @@ docker compose up --build
 # Option B — local dev
 uv venv --python 3.12 .venv && uv pip install -e ".[dev]" -e ./apps/api
 cd apps/dashboard && npm install && cd ../..
-make test              # 148 tests, mock mode, no external services, ~20s
+make test              # 158 tests, mock mode, no external services, ~20s
 make reproduce           # full reproducible experiment -> reproduce_output/
 ```
 

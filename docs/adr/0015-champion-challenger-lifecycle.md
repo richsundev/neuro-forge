@@ -63,7 +63,13 @@ champion's version is not always the highest.
 `GET /promotions/approvals` returns promotions and rollbacks with system and version, and the
 dashboard shows the champion, evolves-from labels, production history and a rollback control.
 `tests/test_lifecycle.py` covers the chain, supersession, both rollback steps, stale promotions and
-the admin requirement. Measured on ForgeSupport: from a promoted champion (quality 0.642), 8 of 10 follow-up searches found a
-further statistically significant gain (+2.3% to +4.8% relative) on validation, and 7 of 10 also
-cleared the holdout gates; the other 3 were correctly rejected (two inconclusive, one with a
-policy-violation upper bound of 0.282 against the 0.28 limit).
+the admin requirement. Measured on ForgeSupport, evolving from a promoted champion: with the champion at quality 0.642,
+10 follow-up searches found a further statistically significant gain in 8 cases (+2.3% to +4.8%
+relative) and 7 cleared the holdout gates. With the baseline-relative objective of
+[ADR-0016](0016-configurable-operable-experiments.md) the *first* champion is already better
+(quality 0.671, +31.1% over v1 rather than +25.4%), and 10 follow-ups then find nothing to promote:
+none is approved (five inconclusive, four likely regressions on the holdout, one likely improvement
+that misses a gate). That is the right outcome rather than a defect — 0.67 is about the ceiling of
+this search space (the best follow-up in the earlier run reached 0.673), so what's left is noise,
+and the promotion review rejected all of it. The lifecycle's job is to make that visible, not to
+manufacture a promotion.

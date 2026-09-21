@@ -78,6 +78,15 @@ class ExperimentCreateRequest(BaseModel):
     # Per-experiment overrides of the promotion gates and safety limits (defaults apply when omitted).
     promotion_gates: PromotionGateConfig | None = None
     safety_constraints: SafetyConstraints | None = None
+    # Which knobs the search may turn: genome sections ("prompt", "retrieval", ...) and/or field paths
+    # ("retrieval.top_k"). Omit to search everything the domain offers; fields left out keep the
+    # baseline's values. See GET /domains for what a domain offers.
+    search_dimensions: list[Annotated[str, StringConstraints(min_length=1, max_length=64)]] | None = Field(
+        default=None, min_length=1, max_length=40
+    )
+    # What "better" means: pin the listed metrics to these shares of the total objective; the rest keep
+    # their relative balance (e.g. {"cost_usd": 0.4} = cost is 40% of what you care about).
+    objective_weights: dict[str, Annotated[float, Field(ge=0.0, le=1000.0)]] | None = None
 
     _domain = field_validator("domain")(_known_domain)
 
