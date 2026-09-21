@@ -2,7 +2,9 @@
 
 ## Versioning
 
-`datasets/dataset.py:DatasetVersion` is an immutable, content-hashed snapshot of `Challenge`s,
+`datasets/dataset.py:DatasetVersion` is an immutable, hashed snapshot of `Challenge`s (the hash covers
+the dataset id and version as well as the challenges — with a content-only hash, two datasets seeded
+with the same parameters collided on the database's unique hash and the second was never created),
 carrying `parent_version`, `source` (`seed` | `failure_driven` | `benchmark_evolution`), and a
 `difficulty_score`. `seed_dataset()` builds the first version; `evolve_if_saturated()` builds the
 next one when candidates start saturating the current one.
@@ -28,7 +30,7 @@ split. `seed_dataset` defaults to 300 challenges (the CLI, API and reproduce scr
 which realizes roughly 205 / 45 / 50 train / validation / holdout — at 100 challenges the
 validation and holdout splits held 15–25, too few to bound a rate.
 
-`deterministic_split()` assigns each challenge to train/validation/holdout via a stable hash of
+`deterministic_split()` assigns each *new* challenge to train/validation/holdout via a stable hash of
 `(seed, challenge_id)` — the same challenge always lands in the same split even as the dataset
 grows, so adding challenges later doesn't reshuffle earlier promotion decisions' evidence.
 

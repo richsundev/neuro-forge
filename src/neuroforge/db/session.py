@@ -68,10 +68,18 @@ def _add_missing_columns(engine) -> None:
                     "database)"
                 )
             column_type = column.type.compile(engine.dialect)
-            with engine.begin() as connection:
-                connection.execute(
-                    text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column_type}')
-                )
+            try:
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" {column_type}')
+                    )
+            except Exception:
+                # Two replicas starting together can both see the column missing; the loser's ALTER
+                # fails with "already exists". Only re-raise if the column still isn't there.
+                fresh = {c["name"] for c in inspect(engine).get_columns(table.name)}
+                if column.name not in fresh:
+                    raise
+                continue
             logger.warning("added missing column %s.%s to an existing database", table.name, column.name)
 
 

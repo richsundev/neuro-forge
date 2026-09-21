@@ -23,8 +23,18 @@ class DatasetVersion(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def hash(self) -> str:
+        # Identity includes the dataset id and version, not just the challenges. The hash is
+        # unique in the database, and two datasets generated with the same parameters have identical
+        # challenges: with a content-only hash, seeding "beta" after "alpha" (same n and seed — e.g.
+        # two applications auto-seeding with the defaults) returned 200 and silently created nothing.
         payload = json.dumps(
-            [c.model_dump(mode="json") for c in self.challenges], sort_keys=True, default=str
+            {
+                "dataset_id": self.dataset_id,
+                "version": self.version,
+                "challenges": [c.model_dump(mode="json") for c in self.challenges],
+            },
+            sort_keys=True,
+            default=str,
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 

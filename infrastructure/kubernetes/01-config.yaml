@@ -8,4 +8,9 @@ metadata:
 data:
   NEUROFORGE_REDIS_URL: "redis://neuroforge-redis:6379/0"
   NEUROFORGE_STATE_DIR: "/data/neuroforge_state"
-  NEXT_PUBLIC_API_URL: "http://neuroforge-api:8000"
+  # NOTE: the dashboard's API URL is deliberately NOT configured here. Next.js inlines
+  # NEXT_PUBLIC_* variables into the browser bundle at *build* time, so a runtime env var on the
+  # pod has no effect — and this in-cluster hostname (http://neuroforge-api:8000) would be
+  # unreachable from a user's browser anyway. Build the dashboard image with the public URL:
+  #   docker build -f infrastructure/docker/dashboard.Dockerfile \
+  #     --build-arg NEXT_PUBLIC_API_URL=https://neuroforge-api.example.com -t neuroforge-dashboard .

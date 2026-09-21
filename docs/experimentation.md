@@ -31,6 +31,11 @@ Rationale and measurements: ADR-0014.
 
 ## Which dataset
 
+A first run uses the dataset's latest version; a *resumed* run keeps the version recorded in its
+checkpoint (`ExperimentCheckpoint.dataset_version`), even if the dataset has been evolved since —
+batches evaluated on different versions aren't comparable. The engine refuses (`DatasetChanged`) to
+resume on a different version.
+
 `ExperimentConfig.dataset_id` records the dataset the experiment was created with (falling back to
 `<application_id>-dataset` for older experiments), and `ExperimentResult` records the dataset
 version it actually ran against, so a later promotion review measures the holdout of the same
@@ -64,7 +69,10 @@ just the current process's uptime.
 `neuroforge experiment cancel <id>` (or `POST /api/v1/experiments/{id}/cancel`) touches a
 `<id>.cancel` file in the experiment's state directory. The engine checks for it at the top of
 every loop iteration — cooperative cancellation, so an in-flight batch finishes before stopping
-rather than being killed mid-evaluation.
+rather than being killed mid-evaluation. Only `running` or `queued` experiments can be cancelled
+(anything else is a 409): a flag left behind for an idle experiment used to cancel its *next* run.
+A cancelled run finishes with status `cancelled` (a partial result, not `completed`) and can be
+resumed.
 
 ## Reproducibility metadata
 

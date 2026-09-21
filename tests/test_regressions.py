@@ -431,7 +431,9 @@ def test_checkpoint_endpoint_handles_an_experiment_that_never_started(client, tm
     c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
     c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 40, "seed": 1}, headers=h)
     c.post("/api/v1/experiments", json=_experiment(), headers=h)
-    assert c.post("/api/v1/experiments/e1/cancel", headers=h).status_code == 200
+    flag = tmp_path / "state" / "e1" / "e1.cancel"
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.touch()  # a cancel request that arrived before the run started
     c.post("/api/v1/experiments/e1/run", headers=h)
     resp = c.get("/api/v1/experiments/e1/checkpoint", headers=h)
     assert resp.status_code == 200  # best_fitness was -inf: not JSON-serializable, and unreadable
@@ -519,3 +521,66 @@ def test_api_timestamps_carry_a_utc_offset(client):
     c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
     created = c.get("/api/v1/applications", headers=h).json()[0]["created_at"]
     assert created.endswith("+00:00")
+
+
+def test_cancelling_an_idle_experiment_is_refused(client):
+    """A cancel flag left behind for an experiment that isn't running silently cancelled its next
+    run and relabelled a finished experiment as cancelled."""
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 40, "seed": 1}, headers=h)
+    c.post("/api/v1/experiments", json=_experiment(), headers=h)
+    assert c.post("/api/v1/experiments/e1/cancel", headers=h).status_code == 409  # created, not running
+    c.post("/api/v1/experiments/e1/run", headers=h)
+    assert c.post("/api/v1/experiments/e1/cancel", headers=h).status_code == 409  # already completed
+
+
+def test_a_cancelled_run_is_reported_as_cancelled_not_completed(baseline_genome, small_dataset, tmp_path):
+    (tmp_path / "x.cancel").touch()
+    ExperimentEngine(_config("random", 16), baseline_genome, small_dataset, tmp_path).run()
+    assert ExperimentCheckpoint.load(tmp_path / "x.checkpoint.json").status == "cancelled"
+
+
+def test_two_datasets_with_identical_parameters_are_both_created(client):
+    """The unique content hash ignored the dataset id, so seeding "beta" with the same n and seed as
+    "alpha" (two applications auto-seeding with the defaults) returned 200 and created nothing."""
+    c, h = client
+    for dataset_id in ("alpha", "beta"):
+        assert c.post("/api/v1/datasets", json={"dataset_id": dataset_id, "n": 40, "seed": 1}, headers=h).status_code == 200
+    assert {d["dataset_id"] for d in c.get("/api/v1/datasets", headers=h).json()} == {"alpha", "beta"}
+
+
+def test_reseeding_a_dataset_id_is_idempotent_or_a_conflict(client):
+    c, h = client
+    body = {"dataset_id": "alpha", "n": 40, "seed": 1}
+    assert c.post("/api/v1/datasets", json=body, headers=h).status_code == 200
+    assert c.post("/api/v1/datasets", json=body, headers=h).status_code == 200  # identical: no-op
+    assert c.post("/api/v1/datasets", json={**body, "seed": 2}, headers=h).status_code == 409
+    assert len([d for d in c.get("/api/v1/datasets", headers=h).json() if d["dataset_id"] == "alpha"]) == 1
+
+
+def test_a_resumed_experiment_keeps_the_dataset_version_it_started_on(client):
+    """Resume always took the dataset's *latest* version, so batches evaluated on v1 and batches
+    evaluated on an evolved v2 ended up in one fitness history."""
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 60, "seed": 1}, headers=h)
+    c.post("/api/v1/experiments", json=_experiment(), headers=h)
+    first = c.post("/api/v1/experiments/e1/run", headers=h).json()
+    assert first["dataset_version"] == 1
+    evolved = c.post("/api/v1/datasets/app-dataset/evolve", json={"mean_score": 0.95, "n_new": 20}, headers=h)
+    assert evolved.json()["version"] == 2
+    again = c.post("/api/v1/experiments/e1/run", headers=h).json()
+    assert again["dataset_version"] == 1
+    # A *new* experiment does pick up the evolved dataset.
+    c.post("/api/v1/experiments", json=_experiment("e2"), headers=h)
+    assert c.post("/api/v1/experiments/e2/run", headers=h).json()["dataset_version"] == 2
+
+
+def test_the_engine_refuses_to_resume_on_a_different_dataset_version(baseline_genome, small_dataset, tmp_path):
+    from neuroforge.experiments.engine import DatasetChanged
+
+    ExperimentEngine(_config("random", 8), baseline_genome, small_dataset, tmp_path).run()
+    evolved = small_dataset.model_copy(update={"version": small_dataset.version + 1})
+    with pytest.raises(DatasetChanged):
+        ExperimentEngine(_config("random", 16), baseline_genome, evolved, tmp_path).run()

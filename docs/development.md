@@ -45,6 +45,9 @@ Being direct about the gap between this reference implementation and a productio
 - **Traffic-shifting canary**: `promotion/canary.py` simulates canary traffic against mock/replay
   data. A real deployment needs integration with an actual load balancer or feature-flag service
   to shift real traffic percentages.
+- **Dashboard API URL is a build-time setting.** `NEXT_PUBLIC_API_URL` is inlined into the browser
+  bundle by `next build`, so it must be passed as a Docker build arg (and must be a URL the *browser*
+  can reach, not an in-cluster service name); setting it as a pod env var does nothing.
 - **Shared filesystem for experiment state**: the Kubernetes manifests mount a `ReadWriteMany` PVC
   for `NEUROFORGE_STATE_DIR` (checkpoints + event logs), since both `api` and `worker` pods write
   to it. Most cloud block storage (EBS, GCE PD) is `ReadWriteOnce` only — a real deployment needs

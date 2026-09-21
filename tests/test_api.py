@@ -276,6 +276,16 @@ def test_promotion_finalize_requires_admin_approval_and_passed_canary(client):
 
     assert genome_status() == "CANARY"
 
+    # A repeat approved review must not demote a genome whose canary already passed.
+    with session_scope() as session:
+        save_promotion_decision(
+            session,
+            best_hash,
+            "exp-finalize-test",
+            GateDecision(approved=True, next_status=PromotionStatus.APPROVED, reasons=["ok again"]),
+        )
+    assert genome_status() == "CANARY"
+
     # Viewer/operator keys cannot finalize even once the gates are satisfied — admin only.
     resp = c.post(
         "/api/v1/api-keys", json={"name": "ops", "role": "operator"}, headers=headers

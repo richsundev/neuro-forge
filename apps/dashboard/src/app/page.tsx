@@ -11,6 +11,7 @@ const STATUS_BADGE: Record<string, string> = {
   created: "bg-slate-200 text-slate-600",
   queued: "bg-warn/10 text-warn",
   failed: "bg-bad/10 text-bad",
+  cancelled: "bg-warn/10 text-warn",
 };
 
 export default function OverviewPage() {

@@ -11,14 +11,33 @@ export function setApiKey(key: string): void {
   }
 }
 
+/** FastAPI errors are `{"detail": "..."}` (HTTPException) or `{"detail": [{loc, msg}, ...]}`
+ * (validation). Show the human part instead of a raw JSON blob. */
+async function failure(method: string, path: string, res: Response): Promise<Error> {
+  const raw = await res.text();
+  let detail = raw;
+  try {
+    const parsed = JSON.parse(raw) as { detail?: unknown };
+    if (typeof parsed.detail === "string") {
+      detail = parsed.detail;
+    } else if (Array.isArray(parsed.detail)) {
+      detail = parsed.detail
+        .map((d: { loc?: unknown[]; msg?: string }) =>
+          `${(d.loc ?? []).filter((p) => p !== "body").join(".")}: ${d.msg ?? "invalid"}`)
+        .join("; ");
+    }
+  } catch {
+    // not JSON — keep the raw text
+  }
+  return new Error(`${method} ${path} failed (${res.status}): ${detail}`);
+}
+
 export async function apiGet<T>(path: string): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { "X-API-Key": apiKey() },
     cache: "no-store",
   });
-  if (!res.ok) {
-    throw new Error(`GET ${path} failed: ${res.status} ${await res.text()}`);
-  }
+  if (!res.ok) throw await failure("GET", path, res);
   return res.json();
 }
 
@@ -28,9 +47,7 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
     headers: { "X-API-Key": apiKey(), "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) {
-    throw new Error(`POST ${path} failed: ${res.status} ${await res.text()}`);
-  }
+  if (!res.ok) throw await failure("POST", path, res);
   return res.json();
 }
 

@@ -29,7 +29,7 @@ class ExperimentCheckpoint(BaseModel):
     experiment_id: str
     strategy_name: str
     seed: int
-    status: str = "running"  # running | completed | stopped
+    status: str = "running"  # running | completed | cancelled
     stop_reason: str = ""
     budget_state: dict[str, float] = Field(default_factory=dict)
     tell_batches: list[TellBatch] = Field(default_factory=list)
@@ -39,6 +39,10 @@ class ExperimentCheckpoint(BaseModel):
     # best already clears the constraints, not just its fitness.
     best_feasible: bool = False
     dataset_version_hash: str = ""
+    # The dataset version the search started on. A resumed run must keep using it: batches evaluated
+    # on v1 and batches evaluated on an evolved v2 aren't comparable, and the fitness history would
+    # silently mix them. 0 = written before this field existed (not enforced).
+    dataset_version: int = 0
 
     @field_validator("best_fitness", mode="before")
     @classmethod

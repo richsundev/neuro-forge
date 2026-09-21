@@ -56,6 +56,10 @@ class ExperimentAlreadyRunning(RuntimeError):
     """Another process (or thread) is currently running this experiment."""
 
 
+class DatasetChanged(ValueError):
+    """A resumed experiment was handed a different dataset version than the one it started on."""
+
+
 class DatasetTooSmall(ValueError):
     """The dataset's splits can't support a search plus a validation comparison."""
 
@@ -178,6 +182,7 @@ class ExperimentEngine:
                 strategy_name=self.config.search_strategy,
                 seed=self.config.seed,
                 dataset_version_hash=self.dataset_version.hash(),
+                dataset_version=self.dataset_version.version,
                 best_genome=self.baseline_genome.model_dump(mode="json"),
                 best_fitness=float("-inf"),
             )
@@ -194,6 +199,12 @@ class ExperimentEngine:
                 )
             )
         assert ckpt is not None
+        if resuming and ckpt.dataset_version and ckpt.dataset_version != self.dataset_version.version:
+            raise DatasetChanged(
+                f"experiment '{self.config.experiment_id}' was started on dataset "
+                f"'{self.dataset_version.dataset_id}' v{ckpt.dataset_version} but is being resumed on "
+                f"v{self.dataset_version.version}; resume against v{ckpt.dataset_version}"
+            )
 
         strategy = get_strategy(
             self.config.search_strategy,
@@ -387,7 +398,9 @@ class ExperimentEngine:
                 stop_reason = convergence.reason
                 break
 
-        ckpt.status = "completed"
+        # A user-cancelled run is a partial result, not a finished one; reporting it as "completed"
+        # put it in the Promotion page's candidate list as if its search had run to its budget.
+        ckpt.status = "cancelled" if stop_reason == "cancelled by user" else "completed"
         ckpt.stop_reason = stop_reason
         ckpt.save(self.checkpoint_path)
         self.event_log.emit(

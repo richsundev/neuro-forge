@@ -6,7 +6,7 @@ mock provider, SQLite. Reproduce with the snippets below; nothing here is invent
 
 | operation | throughput |
 |---|---|
-| ForgeSupport candidate evaluation (mock provider) | ~10,300 evaluations/sec |
+| ForgeSupport candidate evaluation (mock provider) | ~13,000 evaluations/sec |
 | genome `model_dump(mode="json")` | ~273,000 calls/sec |
 | genome content hashing (SHA-256) | ~67,000 hashes/sec |
 | mutation candidate generation (`MutationEngine.propose`) | ~13,900 candidates/sec |
@@ -16,12 +16,13 @@ mock provider, SQLite. Reproduce with the snippets below; nothing here is invent
 
 ## What this means in practice
 
-Evaluation against the mock provider, not the optimizer bookkeeping, is the bottleneck — a
-240-candidate experiment with a 47-challenge train split (the `scripts/reproduce.py` main
-experiment) evaluates ~11,000 (genome, challenge) pairs and completes in about a second. A real
-LLM provider would make evaluation the bottleneck by orders of magnitude (network latency per
-request, not microseconds), which is exactly why the mock provider exists for CI/development and
-budget enforcement (`ExperimentBudget.max_requests`/`max_cost_usd`) exists for real-provider runs.
+Evaluation against the mock provider, not the optimizer bookkeeping, is the bottleneck — the
+`scripts/reproduce.py` main experiment (168 candidates against a 205-challenge train split, plus
+the baseline and the validation/holdout passes) evaluates ~35,000 (genome, challenge) pairs and
+completes in about 3 seconds. A real LLM provider would make evaluation the bottleneck by orders of
+magnitude (network latency per request, not microseconds), which is exactly why the mock provider
+exists for CI/development and budget enforcement (`ExperimentBudget.max_requests`/`max_cost_usd`)
+exists for real-provider runs.
 
 ## Known scaling limits
 
@@ -29,6 +30,11 @@ budget enforcement (`ExperimentBudget.max_requests`/`max_cost_usd`) exists for r
   hundreds of candidates a single experiment produces, would need a sweep-line algorithm
   (O(n log n)) if ever run over tens of thousands of points at once (e.g. cross-experiment
   leaderboards).
+- **Grid search walks a huge space lazily.** ForgeSupport's space has ~22M grid points at 4 steps;
+  building the list was an out-of-memory crash, so the grid is now iterated on demand
+  (`SearchSpace.iter_grid`). It is still exhaustive in principle and useless in practice at that
+  size — a budget of a few hundred candidates only ever sees the first corner of the grid, so use
+  it on small bounded spaces, not the default genome space.
 - **The bandit strategy used to be combinatorially explosive** — see docs/optimization.md and
   `test_bandit_arm_count_stays_bounded_in_high_dimensional_spaces` — fixed by bounding the arm
   pool via sampling instead of a full Cartesian-product grid.

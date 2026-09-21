@@ -71,7 +71,14 @@ def list_genomes_for_system(session: Session, system_id: str) -> list[GenomeReco
 
 def save_dataset_version(session: Session, dataset: DatasetVersion) -> DatasetVersionRecord:
     h = dataset.hash()
-    existing = session.scalar(select(DatasetVersionRecord).where(DatasetVersionRecord.dataset_hash == h))
+    # A (dataset_id, version) pair is one row. Looking up by content hash alone treated any two
+    # datasets with identical challenges as the same dataset.
+    existing = session.scalar(
+        select(DatasetVersionRecord).where(
+            DatasetVersionRecord.dataset_id == dataset.dataset_id,
+            DatasetVersionRecord.version == dataset.version,
+        )
+    )
     if existing is not None:
         return existing
     record = DatasetVersionRecord(
@@ -170,7 +177,16 @@ def save_promotion_decision(
         evidence=decision.evidence,
     )
     session.add(record)
-    _advance_status(session, genome_hash, decision.next_status.value)
+    # A repeat review of a genome whose canary already passed must not demote it from CANARY back to
+    # APPROVED (the canary record still stands and `finalize` still honours it); a *rejection* is
+    # fresh contrary evidence and does apply.
+    only_from = None
+    if decision.approved:
+        only_from = {s.value for s in PromotionStatus} - {
+            PromotionStatus.CANARY.value,
+            PromotionStatus.PROMOTED.value,
+        }
+    _advance_status(session, genome_hash, decision.next_status.value, only_from=only_from)
     return record
 
 

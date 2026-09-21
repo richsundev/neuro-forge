@@ -43,15 +43,9 @@ class EventLog:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._events: list[Event] = []
+        self._tail_checked = False
         if self.path.exists():
-            raw = self.path.read_text()
-            if raw and not raw.endswith("\n"):
-                # Terminate a torn final line so the next append starts on a fresh line instead of
-                # being glued onto the fragment (which would corrupt that event too).
-                with self.path.open("a") as f:
-                    f.write("\n")
-                raw += "\n"
-            for line in raw.splitlines():
+            for line in self.path.read_text().splitlines():
                 if not line.strip():
                     continue
                 try:
@@ -62,7 +56,24 @@ class EventLog:
                     # making the whole experiment unresumable (see scripts/failures/worker_crash.py).
                     continue
 
+    def _terminate_torn_tail(self) -> None:
+        """Make sure the file ends in a newline before the first append, so a new event isn't glued
+        onto a torn fragment (which would corrupt it too). Done at the first *write*, not when the
+        log is opened: opening happens before the experiment's run lock is taken, and another live
+        writer's in-progress line must not be "repaired" out from under it."""
+        if self._tail_checked:
+            return
+        self._tail_checked = True
+        if self.path.exists() and self.path.stat().st_size > 0:
+            with self.path.open("rb") as f:
+                f.seek(-1, 2)
+                last = f.read(1)
+            if last != b"\n":
+                with self.path.open("a") as f:
+                    f.write("\n")
+
     def emit(self, event: Event) -> None:
+        self._terminate_torn_tail()
         self._events.append(event)
         with self.path.open("a") as f:
             f.write(json.dumps(asdict(event)) + "\n")

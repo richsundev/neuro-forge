@@ -268,6 +268,14 @@ def seed_dataset_endpoint(body: DatasetSeedRequest, principal: Principal = Depen
     domain = get_domain(body.domain)
     dataset = seed_dataset(domain, body.dataset_id, n=body.n, seed=body.seed)
     with session_scope() as session:
+        existing = latest_dataset_version(session, body.dataset_id)
+        if existing is not None and existing.hash() != dataset.hash():
+            # Re-seeding an id with different parameters used to add a second "version 1" row.
+            raise HTTPException(
+                409,
+                f"dataset '{body.dataset_id}' already exists (v{existing.version}); "
+                "use POST /datasets/{id}/evolve to add a version, or pick a new id",
+            )
         save_dataset_version(session, dataset)
     audit(principal.name, "seed_dataset", {"dataset_id": body.dataset_id})
     return dataset.summary()
@@ -406,8 +414,13 @@ def run_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = 
 @app.post("/api/v1/experiments/{experiment_id}/cancel", tags=["experiments"])
 def cancel_experiment_endpoint(experiment_id: ExperimentId, principal: Principal = Depends(require_role("operator"))) -> dict:
     with session_scope() as session:
-        if get_experiment(session, experiment_id) is None:
+        record = get_experiment(session, experiment_id)
+        if record is None:
             raise HTTPException(404, f"unknown experiment '{experiment_id}'")
+        # The flag is only consumed by a run that is (or is about to be) executing. Left behind for an
+        # idle experiment, it silently cancelled the *next* run and relabelled a finished one.
+        if record.status not in ("running", "queued"):
+            raise HTTPException(409, f"experiment '{experiment_id}' is {record.status}, not running or queued")
     flag = _state_dir() / experiment_id / f"{experiment_id}.cancel"
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.touch()

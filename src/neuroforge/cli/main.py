@@ -142,6 +142,12 @@ def dataset_seed(
     d = _domain_or_error(domain)
     dataset = seed_dataset(d, dataset_id, n=n, seed=seed)
     with session_scope() as session:
+        existing = latest_dataset_version(session, dataset_id)
+        if existing is not None and existing.hash() != dataset.hash():
+            raise typer.BadParameter(
+                f"dataset '{dataset_id}' already exists (v{existing.version}); use `dataset evolve` "
+                "to add a version, or pick a new id"
+            )
         save_dataset_version(session, dataset)
     console.print_json(json.dumps(dataset.summary()))
 
@@ -289,6 +295,12 @@ def experiment_resume(experiment_id: str, extra_candidates: int = 100) -> None:
 
 @experiment_cmd.command("cancel")
 def experiment_cancel(experiment_id: str) -> None:
+    with session_scope() as session:
+        record = get_experiment(session, experiment_id)
+        if record is None:
+            raise typer.BadParameter(f"unknown experiment '{experiment_id}'")
+        if record.status not in ("running", "queued"):
+            raise typer.BadParameter(f"experiment '{experiment_id}' is {record.status}, not running or queued")
     flag = state_dir() / experiment_id / f"{experiment_id}.cancel"
     flag.parent.mkdir(parents=True, exist_ok=True)
     flag.touch()

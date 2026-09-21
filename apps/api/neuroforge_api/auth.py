@@ -69,8 +69,17 @@ class RateLimiter:
         # read-modify-write on a bucket could let concurrent requests spend the same token.
         self._lock = threading.Lock()
 
+    MAX_TRACKED_KEYS = 10_000
+
     def _refilled(self, key: str) -> _Bucket:
         now = time.monotonic()
+        if key not in self._buckets and len(self._buckets) >= self.MAX_TRACKED_KEYS:
+            # One bucket per client address is otherwise unbounded (an attacker can vary the address
+            # cheaply). Buckets that have fully refilled carry no state, so dropping them is lossless.
+            full_after = self.capacity / self.refill_per_second
+            self._buckets = {k: b for k, b in self._buckets.items() if now - b.last_refill < full_after}
+            if len(self._buckets) >= self.MAX_TRACKED_KEYS:
+                self._buckets.pop(next(iter(self._buckets)))
         bucket = self._buckets.setdefault(key, _Bucket(tokens=self.capacity))
         elapsed = now - bucket.last_refill
         bucket.tokens = min(self.capacity, bucket.tokens + elapsed * self.refill_per_second)

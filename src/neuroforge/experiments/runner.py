@@ -13,12 +13,14 @@ from pathlib import Path
 
 from neuroforge.db.repository import (
     dataset_for_experiment,
+    get_dataset_version,
     get_experiment,
     list_genomes_for_system,
     save_experiment,
     save_genome,
 )
 from neuroforge.db.session import session_scope
+from neuroforge.experiments.checkpoint import ExperimentCheckpoint
 from neuroforge.experiments.engine import (
     DatasetTooSmall,
     ExperimentAlreadyRunning,
@@ -39,6 +41,16 @@ class UnknownExperiment(RunnerError):
     pass
 
 
+def _dataset_for_run(session, application_id: str, config: ExperimentConfig, experiment_id: str, state_root: Path):
+    """A first run uses the dataset's latest version; a *resumed* run must keep the version its
+    checkpoint started on, even if the dataset has been evolved since."""
+    checkpoint = ExperimentCheckpoint.load_or_none(state_root / experiment_id / f"{experiment_id}.checkpoint.json")
+    if checkpoint is not None and checkpoint.dataset_version:
+        dataset_id = config.dataset_id or f"{application_id}-dataset"
+        return get_dataset_version(session, dataset_id, checkpoint.dataset_version)
+    return dataset_for_experiment(session, application_id, config)
+
+
 def run_recorded_experiment(experiment_id: str, state_root: Path) -> ExperimentResult:
     with session_scope() as session:
         record = get_experiment(session, experiment_id)
@@ -54,7 +66,7 @@ def run_recorded_experiment(experiment_id: str, state_root: Path) -> ExperimentR
             ),
             None,
         )
-        dataset = dataset_for_experiment(session, application_id, config)
+        dataset = _dataset_for_run(session, application_id, config, experiment_id, state_root)
 
     if baseline is None or dataset is None:
         raise RunnerError("experiment is missing its baseline genome or dataset")
