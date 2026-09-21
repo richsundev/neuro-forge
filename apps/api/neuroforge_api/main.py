@@ -28,21 +28,17 @@ from neuroforge.db.repository import (
     genome_from_record,
     get_experiment,
     get_genome,
-    latest_canary_run,
     latest_dataset_version,
-    latest_promotion_decision,
     list_canary_runs,
     list_experiments,
     list_genomes_for_system,
-    list_promotion_approvals,
+    list_production_events,
     list_promotion_decisions,
     next_candidate_version,
     save_canary_result,
     save_dataset_version,
     save_experiment,
     save_genome,
-    save_promotion_approval,
-    set_genome_status,
     upsert_application,
 )
 from neuroforge.db.session import init_db, session_scope
@@ -61,6 +57,14 @@ from neuroforge.genomes.lineage import GenomeStore
 from neuroforge.genomes.schema import PromotionStatus, SystemGenome
 from neuroforge.observability import configure_tracing, get_tracer
 from neuroforge.promotion.canary import fresh_traffic, simulate_canary
+from neuroforge.promotion.lifecycle import (
+    ProductionError,
+    current_champion,
+    original_baseline,
+    promote_to_production,
+    resolve_baseline,
+    rollback_production,
+)
 from neuroforge.promotion.review import ReviewError, review_promotion
 from neuroforge.providers.registry import get_provider
 from neuroforge.util import stable_int
@@ -82,6 +86,7 @@ from neuroforge_api.schemas import (
     ExperimentCreateRequest,
     PromoteRequest,
     PromotionRequest,
+    RollbackRequest,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -92,6 +97,8 @@ logger = logging.getLogger("neuroforge.api")
 DEFAULT_DATASET_SIZE = 300
 
 STATE_DIR_ENV = "NEUROFORGE_STATE_DIR"
+
+_PRODUCTION_STATUS = {"not_found": 404, "conflict": 409, "precondition": 400, "invalid": 400}
 
 ExperimentId = Annotated[str, Path(pattern=ID_PATTERN)]
 
@@ -201,6 +208,45 @@ def _domain_for_dataset(dataset) -> str:
     return {"fs": "forge-support", "sql": "sql-agent", "ra": "research-agent"}.get(prefix, "forge-support")
 
 
+def _production_summary(session, system_id: str) -> dict | None:
+    """The champion for an application: what is in production, since when, and who put it there."""
+    champion = current_champion(session, system_id)
+    if champion is None:
+        return None
+    promoted_at = None
+    promoted_by = None
+    for approval, genome in list_production_events(session, system_id):
+        if genome.hash == champion.hash and (approval.action or "promote") == "promote":
+            promoted_at, promoted_by = _iso_utc(approval.created_at), approval.approved_by
+    return {
+        "genome_hash": champion.hash,
+        "version": champion.version,
+        "promoted_at": promoted_at,
+        "promoted_by": promoted_by,
+    }
+
+
+def _baseline_is_current(session, record, cache: dict[str, str | None]) -> bool:
+    """Whether an experiment was run from what is in production now (the champion, or the original
+    baseline when nothing is promoted) — mirrors the check `finalize` enforces."""
+    system_id = record.application_id
+    if system_id not in cache:
+        champion = current_champion(session, system_id) or original_baseline(session, system_id)
+        cache[system_id] = champion.hash if champion else None
+    expected = cache[system_id]
+    started_from = (record.config or {}).get("baseline_hash")
+    if started_from is None:  # created before baselines were recorded: it started from v1
+        original = original_baseline(session, system_id)
+        started_from = original.hash if original else None
+    return expected is None or started_from == expected
+
+
+def _baseline_version(session, record) -> int:
+    baseline_hash = (record.config or {}).get("baseline_hash")
+    genome = session.get(GenomeRecord, baseline_hash) if baseline_hash else None
+    return genome.version if genome is not None else 1
+
+
 def _best_genome_hash(result: dict | None) -> str | None:
     """The content hash isn't stored as a field on the serialized genome (it's computed, not
     persisted — see genomes/schema.py) so recompute it here for display/action in the dashboard.
@@ -227,7 +273,13 @@ def list_applications(principal: Principal = Depends(require_role("viewer"))) ->
     with session_scope() as session:
         rows = list(session.scalars(select(ApplicationRecord)))
         return [
-            {"id": r.id, "name": r.name, "domain": r.domain_name, "created_at": _iso_utc(r.created_at)}
+            {
+                "id": r.id,
+                "name": r.name,
+                "domain": r.domain_name,
+                "created_at": _iso_utc(r.created_at),
+                "production": _production_summary(session, r.id),
+            }
             for r in rows
         ]
 
@@ -340,15 +392,29 @@ def create_experiment(body: ExperimentCreateRequest, principal: Principal = Depe
         if baseline is None:
             baseline = SystemGenome(system_id=body.system_id, version=1)
             save_genome(session, baseline)
+            session.flush()  # sessions here don't autoflush; the baseline lookup below must see it
+        try:
+            baseline_record = resolve_baseline(session, body.system_id, body.baseline)
+        except ProductionError as exc:
+            raise HTTPException(_PRODUCTION_STATUS[exc.kind], str(exc)) from exc
+        if baseline_record is None:  # unreachable while v1 is saved above; kept as a clear failure
+            raise HTTPException(400, f"no baseline genome for '{body.system_id}'")
         dataset = latest_dataset_version(session, dataset_id)
         if dataset is None:
             dataset = seed_dataset(domain, dataset_id, n=DEFAULT_DATASET_SIZE, seed=body.seed)
             save_dataset_version(session, dataset)
 
+        overrides: dict = {}
+        if body.promotion_gates is not None:
+            overrides["promotion_gates"] = body.promotion_gates
+        if body.safety_constraints is not None:
+            overrides["safety_constraints"] = body.safety_constraints
         config = ExperimentConfig(
             experiment_id=body.experiment_id,
             domain_name=body.domain,
             dataset_id=dataset_id,
+            baseline_hash=baseline_record.hash,
+            **overrides,
             first_candidate_version=next_candidate_version(session, body.system_id),
             search_strategy=body.strategy,
             search_space=search_space_for_domain(body.domain),
@@ -359,18 +425,31 @@ def create_experiment(body: ExperimentCreateRequest, principal: Principal = Depe
         )
         save_experiment(session, body.system_id, config, status="created")
     audit(principal.name, "create_experiment", {"experiment_id": body.experiment_id})
-    return {"experiment_id": body.experiment_id, "created": True}
+    return {
+        "experiment_id": body.experiment_id,
+        "created": True,
+        "baseline_hash": baseline_record.hash,
+        "baseline_version": baseline_record.version,
+    }
 
 
 @app.get("/api/v1/experiments", tags=["experiments"])
 def list_experiments_endpoint(principal: Principal = Depends(require_role("viewer"))) -> list[dict]:
     with session_scope() as session:
         rows = list_experiments(session)
+        production_cache: dict[str, str | None] = {}
         return [
             {
                 "experiment_id": r.experiment_id,
                 "application_id": r.application_id,
                 "dataset_id": (r.config or {}).get("dataset_id") or f"{r.application_id}-dataset",
+                # A genome ident the canary endpoint accepts; experiments created before baselines
+                # were recorded started from the application's v1.
+                "baseline": (r.config or {}).get("baseline_hash") or f"{r.application_id}@v1",
+                "baseline_version": _baseline_version(session, r),
+                # False once production has moved on: promoting this experiment's winner would be
+                # refused, because it was never compared with what is running now.
+                "baseline_is_current": _baseline_is_current(session, r, production_cache),
                 "domain": r.domain_name,
                 "strategy": r.search_strategy,
                 "status": r.status,
@@ -581,40 +660,54 @@ def finalize_promotion(body: PromoteRequest, principal: Principal = Depends(requ
     everything up to here (`request_promotion`, `run_canary`) can be run by an `operator` key —
     the kind CI/automation holds — but only an `admin` key can take a candidate live, and doing so
     is recorded in `promotion_approvals` against the caller's own name so it's always attributable
-    to a specific person, not just "the pipeline"."""
+    to a specific person, not just "the pipeline". The genome becomes the application's champion;
+    the previous champion is marked SUPERSEDED (and can be restored by a rollback)."""
     with session_scope() as session:
-        genome_record = session.get(GenomeRecord, body.genome_hash)
-        if genome_record is None:
-            raise HTTPException(404, f"unknown genome '{body.genome_hash}'")
-        if genome_record.status == PromotionStatus.PROMOTED.value:
-            # Otherwise a second click (or a retry) recorded a second approval for the same action.
-            raise HTTPException(409, "this genome is already promoted")
-        decision = latest_promotion_decision(session, body.genome_hash)
-        if decision is None or not decision.approved:
-            raise HTTPException(400, "no approved promotion decision on record for this genome")
-        canary = latest_canary_run(session, body.genome_hash)
-        if canary is None:
-            raise HTTPException(400, "no canary run on record for this genome — run a canary before promoting")
-        if canary.rollback_triggered:
-            raise HTTPException(400, "the latest canary run triggered a rollback — cannot promote")
-        set_genome_status(session, body.genome_hash, PromotionStatus.PROMOTED.value)
-        save_promotion_approval(session, body.genome_hash, body.experiment_id, principal.name)
-    audit(principal.name, "finalize_promotion", {"genome_hash": body.genome_hash})
-    return {"genome_hash": body.genome_hash, "status": PromotionStatus.PROMOTED.value, "approved_by": principal.name}
+        try:
+            outcome = promote_to_production(session, body.genome_hash, body.experiment_id, principal.name)
+        except ProductionError as exc:
+            raise HTTPException(_PRODUCTION_STATUS[exc.kind], str(exc)) from exc
+        superseded = outcome.superseded.hash if outcome.superseded else None
+    audit(principal.name, "finalize_promotion", {"genome_hash": body.genome_hash, "superseded": superseded})
+    return {
+        "genome_hash": body.genome_hash,
+        "status": PromotionStatus.PROMOTED.value,
+        "approved_by": principal.name,
+        "superseded": superseded,
+    }
+
+
+@app.post("/api/v1/promotions/rollback", tags=["promotions"])
+def rollback_promotion(body: RollbackRequest, principal: Principal = Depends(require_role("admin"))) -> dict:
+    """Take the current champion out of production and restore the one it replaced (or, if it was the
+    first, go back to the original baseline). Admin-only and logged, like promoting."""
+    with session_scope() as session:
+        try:
+            outcome = rollback_production(session, body.system_id, principal.name)
+        except ProductionError as exc:
+            raise HTTPException(_PRODUCTION_STATUS[exc.kind], str(exc)) from exc
+        rolled_back = outcome.rolled_back.hash
+        restored = outcome.restored.hash if outcome.restored else None
+    audit(principal.name, "rollback_production", {"system_id": body.system_id, "rolled_back": rolled_back, "restored": restored})
+    return {"system_id": body.system_id, "rolled_back": rolled_back, "restored": restored, "approved_by": principal.name}
 
 
 @app.get("/api/v1/promotions/approvals", tags=["promotions"])
 def list_promotion_approvals_endpoint(principal: Principal = Depends(require_role("viewer"))) -> list[dict]:
+    """Every production change (promotion or rollback), newest first."""
     with session_scope() as session:
-        rows = list_promotion_approvals(session)
+        events = list_production_events(session)
         return [
             {
-                "genome_hash": r.genome_hash,
-                "experiment_id": r.experiment_id,
-                "approved_by": r.approved_by,
-                "created_at": _iso_utc(r.created_at),
+                "genome_hash": approval.genome_hash,
+                "system_id": genome.system_id,
+                "version": genome.version,
+                "experiment_id": approval.experiment_id,
+                "approved_by": approval.approved_by,
+                "action": approval.action or "promote",
+                "created_at": _iso_utc(approval.created_at),
             }
-            for r in rows
+            for approval, genome in reversed(events)
         ]
 
 

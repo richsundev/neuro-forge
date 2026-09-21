@@ -51,17 +51,31 @@ export async function apiPost<T>(path: string, body: unknown): Promise<T> {
   return res.json();
 }
 
+export interface ProductionSummary {
+  genome_hash: string;
+  version: number;
+  promoted_at: string | null;
+  promoted_by: string | null;
+}
+
 export interface ApplicationSummary {
   id: string;
   name: string;
   domain: string;
   created_at: string;
+  /** The champion: the genome in production. null = the original baseline (v1). */
+  production: ProductionSummary | null;
 }
 
 export interface ExperimentSummary {
   experiment_id: string;
   application_id: string;
   dataset_id: string;
+  /** What the search evolved from — a genome the canary endpoint accepts (hash or `app@v1`). */
+  baseline: string;
+  baseline_version: number;
+  /** false once production has moved on — promoting this experiment's winner would be refused. */
+  baseline_is_current: boolean;
   domain: string;
   strategy: string;
   status: string;
@@ -155,8 +169,11 @@ export interface PromotionRecord {
 
 export interface PromotionApproval {
   genome_hash: string;
+  system_id: string;
+  version: number;
   experiment_id: string | null;
   approved_by: string;
+  action: "promote" | "rollback";
   created_at: string;
 }
 

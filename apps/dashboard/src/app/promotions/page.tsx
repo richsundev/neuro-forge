@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import {
   apiGet,
   apiPost,
+  type ApplicationSummary,
   type CanaryRecord,
   type ExperimentSummary,
   type PromotionApproval,
@@ -23,13 +24,13 @@ function CandidateRow({
   experiment,
   promotions,
   canaries,
-  approvals,
+  production,
   onActionComplete,
 }: {
   experiment: ExperimentSummary;
   promotions: PromotionRecord[];
   canaries: CanaryRecord[];
-  approvals: PromotionApproval[];
+  production: ApplicationSummary["production"];
   onActionComplete: () => void;
 }) {
   const [decision, setDecision] = useState<PromotionDecision | null>(null);
@@ -41,21 +42,23 @@ function CandidateRow({
   const [nRequests, setNRequests] = useState(200);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [justPromoted, setJustPromoted] = useState<{ approved_by: string } | null>(null);
 
   // Promotions/canaries are sorted newest-first by the API, so the first match is the latest —
   // this reads server truth rather than only this row's own local state, so eligibility survives
   // a page reload instead of resetting whenever `decision`/`canaryResult` go back to null.
   const latestDecision = promotions.find((p) => p.genome_hash === experiment.best_genome_hash);
   const latestCanary = canaries.find((c) => c.candidate_hash === experiment.best_genome_hash);
-  const canPromote = !!latestDecision?.approved && !!latestCanary && !latestCanary.rollback_triggered;
-  // Promoted-ness comes from the server's approval records, not this row's local state: after a
-  // reload local state is gone, and the button used to re-enable for an already-promoted genome.
-  const existingApproval = approvals.find((a) => a.genome_hash === experiment.best_genome_hash);
-  const promoted = justPromoted ?? existingApproval ?? null;
+  const stale = !experiment.baseline_is_current;
+  const canPromote =
+    !!latestDecision?.approved && !!latestCanary && !latestCanary.rollback_triggered && !stale;
+  // Promoted-ness comes from the server (is this genome the application's champion?), not this
+  // row's local state: after a reload local state is gone, and the button used to re-enable for an
+  // already-promoted genome. A rolled-back genome is no longer the champion, so it can be promoted again.
+  const isChampion = !!production && production.genome_hash === experiment.best_genome_hash;
+  const promoted = isChampion ? { approved_by: production?.promoted_by ?? "" } : null;
 
   const datasetId = experiment.dataset_id;
-  const baselineIdent = `${experiment.application_id}@v1`;
+  const baselineIdent = experiment.baseline;
 
   async function requestPromotion() {
     if (!experiment.best_genome_hash) return;
@@ -104,11 +107,10 @@ function CandidateRow({
     setBusy(true);
     setError(null);
     try {
-      const result = await apiPost<{ genome_hash: string; status: string; approved_by: string }>(
-        "/api/v1/promotions/finalize",
-        { genome_hash: experiment.best_genome_hash, experiment_id: experiment.experiment_id }
-      );
-      setJustPromoted(result);
+      await apiPost("/api/v1/promotions/finalize", {
+        genome_hash: experiment.best_genome_hash,
+        experiment_id: experiment.experiment_id,
+      });
       onActionComplete();
     } catch (err) {
       setError((err as Error).message);
@@ -121,6 +123,9 @@ function CandidateRow({
     <div className="border-t border-slate-100 py-4">
       <div className="flex flex-wrap items-center gap-3">
         <span className="font-medium">{experiment.experiment_id}</span>
+        <span className="badge bg-slate-100 text-slate-600" title={experiment.baseline}>
+          {experiment.baseline_version === 1 ? "from original v1" : `from champion v${experiment.baseline_version}`}
+        </span>
         <span className="text-sm text-slate-500">{experiment.comparison_summary}</span>
         <span className="ml-auto flex gap-2">
           <button
@@ -141,9 +146,11 @@ function CandidateRow({
             disabled={busy || !canPromote || !!promoted}
             onClick={finalizePromotion}
             title={
-              canPromote
-                ? "Requires an admin-role API key"
-                : "Requires an approved promotion decision and a passed (non-rollback) canary run first"
+              stale
+                ? "Production has moved on since this experiment ran — re-run it from the current champion"
+                : canPromote
+                  ? "Requires an admin-role API key"
+                  : "Requires an approved promotion decision and a passed (non-rollback) canary run first"
             }
             className="rounded-md bg-good px-3 py-1.5 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
           >
@@ -239,7 +246,13 @@ function CandidateRow({
           <span className="font-mono text-xs">{promoted.approved_by}</span>
         </div>
       )}
-      {!promoted && latestCanary && !latestCanary.rollback_triggered && latestDecision?.approved && (
+      {!promoted && stale && (
+        <p className="mt-2 text-sm text-slate-500">
+          Superseded &mdash; production has moved on since this experiment ran, so its winner can no longer be
+          promoted. Re-run it from the current champion.
+        </p>
+      )}
+      {!promoted && !stale && latestCanary && !latestCanary.rollback_triggered && latestDecision?.approved && (
         <p className="mt-2 text-sm text-slate-500">
           Passed promotion gates and canary — awaiting an admin&rsquo;s explicit &ldquo;Promote to
           production&rdquo;.
@@ -254,20 +267,23 @@ export default function PromotionsPage() {
   const [promotions, setPromotions] = useState<PromotionRecord[]>([]);
   const [canaries, setCanaries] = useState<CanaryRecord[]>([]);
   const [approvals, setApprovals] = useState<PromotionApproval[]>([]);
+  const [applications, setApplications] = useState<ApplicationSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   async function load() {
     try {
-      const [e, p, c, a] = await Promise.all([
+      const [e, p, c, a, apps] = await Promise.all([
         apiGet<ExperimentSummary[]>("/api/v1/experiments"),
         apiGet<PromotionRecord[]>("/api/v1/promotions"),
         apiGet<CanaryRecord[]>("/api/v1/canaries"),
         apiGet<PromotionApproval[]>("/api/v1/promotions/approvals"),
+        apiGet<ApplicationSummary[]>("/api/v1/applications"),
       ]);
       setExperiments(e.filter((x) => x.status === "completed" && x.recommendation));
       setPromotions(p);
       setCanaries(c);
       setApprovals(a);
+      setApplications(apps);
       setError(null);
     } catch (err) {
       setError((err as Error).message);
@@ -278,14 +294,16 @@ export default function PromotionsPage() {
   // remount every CandidateRow and drop its in-progress local state (open canary form, etc).
   async function refreshHistory() {
     try {
-      const [p, c, a] = await Promise.all([
+      const [p, c, a, apps] = await Promise.all([
         apiGet<PromotionRecord[]>("/api/v1/promotions"),
         apiGet<CanaryRecord[]>("/api/v1/canaries"),
         apiGet<PromotionApproval[]>("/api/v1/promotions/approvals"),
+        apiGet<ApplicationSummary[]>("/api/v1/applications"),
       ]);
       setPromotions(p);
       setCanaries(c);
       setApprovals(a);
+      setApplications(apps);
     } catch (err) {
       setError((err as Error).message);
     }
@@ -294,6 +312,17 @@ export default function PromotionsPage() {
   useEffect(() => {
     load();
   }, []);
+
+  async function rollback(app: ApplicationSummary) {
+    const label = app.production ? `v${app.production.version}` : "the current champion";
+    if (!window.confirm(`Take ${label} of "${app.id}" out of production? The previous champion is restored.`)) return;
+    try {
+      await apiPost("/api/v1/promotions/rollback", { system_id: app.id });
+      await load();
+    } catch (err) {
+      setError((err as Error).message);
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -323,7 +352,7 @@ export default function PromotionsPage() {
               experiment={e}
               promotions={promotions}
               canaries={canaries}
-              approvals={approvals}
+              production={applications.find((a) => a.id === e.application_id)?.production ?? null}
               onActionComplete={refreshHistory}
             />
           ))
@@ -331,10 +360,64 @@ export default function PromotionsPage() {
       </section>
 
       <section className="card">
-        <h2 className="mb-3 text-base font-semibold">Production promotions</h2>
+        <h2 className="mb-1 text-base font-semibold">In production</h2>
+        <p className="mb-3 text-xs text-slate-500">
+          Each application&rsquo;s champion. New experiments evolve from it, and promoting a candidate
+          replaces it (the old one is kept and can be restored by a rollback).
+        </p>
+        {applications.length === 0 ? (
+          <p className="text-sm text-slate-500">No applications yet.</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="text-left text-slate-500">
+              <tr>
+                <th className="pb-2">application</th>
+                <th className="pb-2">champion</th>
+                <th className="pb-2">promoted by</th>
+                <th className="pb-2" />
+              </tr>
+            </thead>
+            <tbody>
+              {applications.map((a) => (
+                <tr key={a.id} className="border-t border-slate-100">
+                  <td className="py-1.5 font-medium">{a.id}</td>
+                  <td className="py-1.5">
+                    {a.production ? (
+                      <>
+                        v{a.production.version}{" "}
+                        <span className="font-mono text-xs text-slate-500">{a.production.genome_hash}</span>
+                      </>
+                    ) : (
+                      <span className="text-slate-500">original baseline (v1)</span>
+                    )}
+                  </td>
+                  <td className="py-1.5 text-slate-500">
+                    {a.production?.promoted_by ?? "—"}
+                    {a.production?.promoted_at && ` · ${new Date(a.production.promoted_at).toLocaleString()}`}
+                  </td>
+                  <td className="py-1.5 text-right">
+                    {a.production && (
+                      <button
+                        onClick={() => rollback(a)}
+                        title="Requires an admin-role API key"
+                        className="rounded-md border border-bad/40 px-3 py-1 text-xs font-medium text-bad hover:bg-bad/5"
+                      >
+                        Roll back
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section className="card">
+        <h2 className="mb-1 text-base font-semibold">Production history</h2>
         <p className="mb-2 text-xs text-slate-500">
-          Each row is an explicit admin action — this is the human-approval gate between a passed
-          canary and PROMOTED.
+          Every explicit admin action that changed what is in production — the human-approval gate
+          between a passed canary and PROMOTED, and rollbacks.
         </p>
         {approvals.length === 0 ? (
           <p className="text-sm text-slate-500">Nothing has been promoted to production yet.</p>
@@ -342,17 +425,23 @@ export default function PromotionsPage() {
           <table className="w-full text-sm">
             <thead className="text-left text-slate-500">
               <tr>
+                <th className="pb-2">action</th>
+                <th className="pb-2">application</th>
                 <th className="pb-2">genome</th>
-                <th className="pb-2">experiment</th>
-                <th className="pb-2">approved by</th>
+                <th className="pb-2">by</th>
                 <th className="pb-2">when</th>
               </tr>
             </thead>
             <tbody>
               {approvals.map((a, i) => (
                 <tr key={i} className="border-t border-slate-100">
-                  <td className="py-1.5 font-mono text-xs">{a.genome_hash}</td>
-                  <td className="py-1.5">{a.experiment_id}</td>
+                  <td className="py-1.5">
+                    <StatusBadge ok={a.action === "promote"} okLabel="promoted" badLabel="rolled back" />
+                  </td>
+                  <td className="py-1.5">{a.system_id}</td>
+                  <td className="py-1.5">
+                    v{a.version} <span className="font-mono text-xs text-slate-500">{a.genome_hash}</span>
+                  </td>
                   <td className="py-1.5">{a.approved_by}</td>
                   <td className="py-1.5 text-slate-500">{new Date(a.created_at).toLocaleString()}</td>
                 </tr>

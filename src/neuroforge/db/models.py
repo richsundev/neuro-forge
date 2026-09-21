@@ -131,6 +131,9 @@ class PromotionApprovalRecord(Base):
     genome_hash: Mapped[str] = mapped_column(String(32), ForeignKey("system_genomes.hash"), index=True)
     experiment_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     approved_by: Mapped[str] = mapped_column(String(100))
+    # "promote" (a candidate became the production champion) or "rollback" (this genome was taken out
+    # of production). NULL on rows written before the column existed, which were all promotions.
+    action: Mapped[str | None] = mapped_column(String(20), nullable=True, default="promote")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 

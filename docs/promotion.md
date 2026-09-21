@@ -4,14 +4,15 @@
 
 ```
 GENERATED -> VALIDATED -> BENCHMARKED -> HOLDOUT_TESTED -> APPROVED -> CANARY -> PROMOTED
-                                                        \-> REJECTED
-                                              CANARY ---> ROLLED_BACK
+                                                        \-> REJECTED         |
+                                              CANARY ---> ROLLED_BACK   +-> SUPERSEDED (replaced by a newer champion)
+                                                                        +-> ROLLED_BACK (admin rollback)
 ```
 
 `genomes/schema.py:PromotionStatus` and `promotion/gates.py:PROMOTION_ORDER`/`next_allowed_status`
 define the sequence; a genome's `status` field is one of these values. Nothing in this codebase
 auto-advances a genome through every stage — each stage requires an explicit call
-(`neuroforge promotion request`, `neuroforge canary run`, `neuroforge promotion promote`), matching section 69's core distinction:
+(`neuroforge promotion request`, `neuroforge canary run`, `neuroforge promotion promote`, `neuroforge promotion rollback`), matching section 69's core distinction:
 **autonomous discovery, not autonomous deployment.**
 
 ## The human-approval gate (APPROVED/CANARY → PROMOTED)
@@ -30,6 +31,28 @@ its own but cannot itself take a candidate live. The action is logged to `promot
 `promotion_decisions` because it records a human decision, not an automated gate result. The
 dashboard's `/promotions` page surfaces this as a "Promote to production" button that stays
 disabled (with a tooltip explaining why) until both conditions above are met.
+
+## The champion lifecycle (ADR-0015)
+
+Each application has at most one **champion**, the genome in production:
+
+- **Experiments evolve from it.** `POST /experiments` takes `baseline` — `"champion"` (default; the
+  genome in production, else the original), `"original"`, or a genome hash / `<system>@v<N>` — and
+  records the resolved genome on the experiment. Candidates are derived from it, and because the
+  cost/latency gates and the significance test are relative to the baseline, a candidate has to beat
+  what is actually running.
+- **Promoting supersedes.** The promoted genome becomes PROMOTED and the previous champion SUPERSEDED,
+  so exactly one genome per application is PROMOTED.
+- **Rolling back** (`POST /promotions/rollback`, `neuroforge promotion rollback <system>`; admin-only)
+  marks the champion ROLLED_BACK and restores the one it replaced — or the original baseline, if it
+  was the first.
+- **Stale promotions are refused (409).** A candidate is only better than what it was compared with:
+  if its decision was made against a genome other than the current production genome, promoting it
+  could replace a champion it never beat. Re-run the experiment from the current champion.
+
+The approval log (`promotion_approvals`, one row per promotion or rollback) is the source of truth;
+the champion and rollback history are replayed from it, and `system_genomes.status` is a cache for
+the UI.
 
 ## Promotion review: what the decision is based on
 

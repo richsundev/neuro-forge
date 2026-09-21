@@ -64,6 +64,7 @@ export default function OverviewPage() {
               <tr>
                 <th className="pb-2">id</th>
                 <th className="pb-2">domain</th>
+                <th className="pb-2">in production</th>
                 <th className="pb-2">evolution graph</th>
               </tr>
             </thead>
@@ -72,6 +73,16 @@ export default function OverviewPage() {
                 <tr key={a.id} className="border-t border-slate-100">
                   <td className="py-2 font-medium">{a.id}</td>
                   <td className="py-2">{a.domain}</td>
+                  <td className="py-2">
+                    {a.production ? (
+                      <span title={a.production.genome_hash}>
+                        <span className="badge bg-good/10 text-good">v{a.production.version}</span>
+                        <span className="ml-2 font-mono text-xs text-slate-500">{a.production.genome_hash}</span>
+                      </span>
+                    ) : (
+                      <span className="text-slate-500">original baseline</span>
+                    )}
+                  </td>
                   <td className="py-2">
                     <Link href={`/genomes/${a.id}`} className="text-accent hover:underline">
                       view lineage →

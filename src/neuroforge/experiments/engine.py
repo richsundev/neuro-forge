@@ -93,6 +93,10 @@ class ExperimentConfig(BaseModel):
     # — different genomes under one label, and `system@v141` resolved to whichever came first.
     # Allocated at creation (see `next_candidate_version`); None keeps the old numbering.
     first_candidate_version: int | None = Field(default=None, ge=2)
+    # Hash of the genome this experiment evolves from (the current production champion, the original
+    # v1, or any specific genome), recorded at creation so a run and its resumes always start from the
+    # same place. None = legacy: the application's v1.
+    baseline_hash: str | None = None
     # Search aims this far inside the *safety* limits so the winner has headroom against
     # split-to-split sampling noise (cost/latency/quality limits are near-deterministic functions
     # of the configuration, so they need no such buffer).
@@ -302,12 +306,18 @@ class ExperimentEngine:
                         ),
                     )
                     for field_path, value in point.items()
+                    # A search point sets *every* dimension, so most entries equal the baseline's own
+                    # value; recording those as "mutations" listed changes that never happened.
+                    if _changed(get_field_by_path(self.baseline_genome, field_path), value)
                 ]
                 genome = self.baseline_genome.derive(
                     mutations=mutation_records,
                     overrides=point,
                     new_version=next_version,
-                    generation=generation_index,
+                    # Continue the numbering from the baseline: candidates bred from a champion at
+                    # generation 7 are generations 8, 9, ..., not another 0, 1, ... stacked on top of
+                    # the previous experiment's columns in the lineage graph.
+                    generation=self.baseline_genome.generation + 1 + generation_index,
                 )
                 next_version += 1
                 genomes.append(genome)
@@ -531,6 +541,12 @@ class ExperimentEngine:
         if comparison.conclusion == Conclusion.LIKELY_REGRESSION:
             return "REJECT — candidate regressed relative to baseline"
         return "INCONCLUSIVE — insufficient evidence of improvement, keep searching or gather more data"
+
+
+def _changed(old: object, new: object) -> bool:
+    """Whether a search point's value differs from the baseline's (tuples and lists compare equal)."""
+    as_list = lambda v: list(v) if isinstance(v, tuple | list) else v  # noqa: E731
+    return as_list(old) != as_list(new)
 
 
 def _comparison_dict(comparison: ComparisonResult) -> dict:

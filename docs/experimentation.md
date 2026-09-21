@@ -29,6 +29,14 @@ a feasible candidate exists. Each `CandidateEvaluated` event records `feasible` 
 `constraint_violation`; `ExperimentResult.selected_feasible` records whether the winner made it.
 Rationale and measurements: ADR-0014.
 
+## Which baseline
+
+`ExperimentConfig.baseline_hash` records the genome the search evolves from, resolved once at
+creation from the request's `baseline` (`"champion"` — the default — `"original"`, or a specific
+genome). Candidates are derived from it, so lineage edges run from the champion and generation
+numbers continue from its generation; a run and all its resumes start from the same genome. See
+ADR-0015 and docs/promotion.md.
+
 ## Which dataset
 
 A first run uses the dataset's latest version; a *resumed* run keeps the version recorded in its

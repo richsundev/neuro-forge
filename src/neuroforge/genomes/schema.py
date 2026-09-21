@@ -101,6 +101,8 @@ class PromotionStatus(str, Enum):
     PROMOTED = "PROMOTED"
     REJECTED = "REJECTED"
     ROLLED_BACK = "ROLLED_BACK"
+    # Was in production; replaced by a newer champion (still restorable by a rollback).
+    SUPERSEDED = "SUPERSEDED"
 
 
 class SystemGenome(BaseModel):

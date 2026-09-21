@@ -86,7 +86,9 @@ score can't be won by gaming a fixed, easy dataset:
 
 **Promotion** — request promotion (a holdout-split review with its evidence shown), run a canary on
 fresh traffic, then take the candidate live with an explicit, admin-only "Promote to production".
-That button stays disabled until an approved decision *and* a passed canary are both on record:
+That button stays disabled until an approved decision *and* a passed canary are both on record. The
+page also shows what is in production per application (with a rollback control) and the full history of
+production changes; each candidate says which genome it evolved from:
 
 ![Promotion](docs/images/promotions.png)
 
@@ -111,6 +113,7 @@ flowchart LR
     GATE -->|rejected| REJ[REJECTED, with reasons]
     CANARY -->|safe| HUMAN["Admin approval"]
     HUMAN --> PROMOTED
+    PROMOTED -.->|"champion = next baseline"| search
     CANARY -->|regression| ROLLBACK[ROLLED_BACK]
 ```
 
@@ -152,9 +155,10 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 | Challenge Evolution (signature feature) | ✅ | dashboard `/datasets` |
 | Promotion page (candidates, canary, history) — drives promotion/canary from the UI, not just CLI | ✅ | dashboard `/promotions` |
 | Human-approval gate before PROMOTED (admin-role only, attributed and logged) | ✅ | `POST /api/v1/promotions/finalize`, `promotion_approvals` |
+| Champion/challenger loop: experiments evolve from production, promotion supersedes, admin rollback, stale-baseline refusal | ✅ | `promotion/lifecycle.py`, [ADR-0015](docs/adr/0015-champion-challenger-lifecycle.md) |
 | 3 domain plugins (support/SQL/research agent) | ✅ | `domains/` |
 | Deterministic mock provider + real provider adapters | ✅ | `providers/` |
-| REST API (26 endpoints, OpenAPI, auth, rate limiting) | ✅ | `apps/api/` |
+| REST API (27 endpoints, OpenAPI, auth, rate limiting) | ✅ | `apps/api/` |
 | CLI (Typer) | ✅ | `neuroforge` / `src/neuroforge/cli/` |
 | Async worker via Redis queue | ✅ | `scripts/worker.py`, [ADR-0010](docs/adr/0010-redis-queue-not-celery.md) |
 | Docker Compose (6 services, verified working) | ✅ | `docker-compose.yml` |
@@ -163,7 +167,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 | OpenTelemetry tracing (per-request, per-generation spans) | ✅ | `src/neuroforge/observability.py` |
 | Failure injection (6 scenarios, all pass) | ✅ | `make failure-all` |
 | CI (test/lint/typecheck/build/security) | ✅ | `.github/workflows/` |
-| 14 ADRs | ✅ | `docs/adr/` |
+| 15 ADRs | ✅ | `docs/adr/` |
 | Reproducible research mode | ✅ | `make reproduce` |
 
 ## Technology stack
@@ -171,7 +175,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 **Backend**: Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0, Alembic, PostgreSQL (SQLite for
 local/CI), Redis, NumPy/SciPy. **Frontend**: Next.js 14 (App Router), TypeScript (strict),
 Tailwind CSS, Recharts. **Infra**: Docker Compose, Kubernetes, GitHub Actions. **Testing**:
-pytest (131 tests), mypy (strict), Ruff, ESLint, tsc.
+pytest (140 tests), mypy (strict), Ruff, ESLint, tsc.
 
 ## Quick start
 
@@ -186,7 +190,7 @@ docker compose up --build
 # Option B — local dev
 uv venv --python 3.12 .venv && uv pip install -e ".[dev]" -e ./apps/api
 cd apps/dashboard && npm install && cd ../..
-make test              # 131 tests, mock mode, no external services, ~15s
+make test              # 140 tests, mock mode, no external services, ~15s
 make reproduce           # full reproducible experiment -> reproduce_output/
 ```
 
@@ -203,6 +207,15 @@ neuroforge candidate compare support-agent@v1 <best-hash> support-agent-dataset
 neuroforge promotion request <best-hash> exp-1        # holdout review: approved, or the exact limit missed
 neuroforge canary run support-agent@v1 <best-hash> support-agent-dataset   # fresh traffic
 neuroforge promotion promote <best-hash>              # human-approval gate — only if approved + canary passed
+
+# Close the loop: the next experiment evolves from what is now in production, not from v1
+neuroforge app list                                    # shows the champion (genome in production)
+neuroforge experiment create exp-2 --system-id support-agent --seed 2   # --baseline champion is the default
+neuroforge experiment run exp-2
+neuroforge promotion request <best-hash-2> exp-2       # must beat the *champion*, on the holdout
+neuroforge canary run <champion-hash> <best-hash-2> support-agent-dataset
+neuroforge promotion promote <best-hash-2>             # supersedes the champion
+neuroforge promotion rollback support-agent            # ...or take it back out and restore the previous one
 ```
 
 Or drive the same flow from the dashboard: create the experiment via the API, watch it on

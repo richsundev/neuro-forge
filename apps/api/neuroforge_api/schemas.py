@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field, StringConstraints, field_validator
 from neuroforge.domains import DOMAIN_REGISTRY
 from neuroforge.experiments.budget import ExperimentBudget
 from neuroforge.optimization import STRATEGY_REGISTRY
+from neuroforge.promotion.gates import PromotionGateConfig
+from neuroforge.promotion.safety import SafetyConstraints
 
 # Identifiers become file names (an experiment's checkpoint, events and lock live under
 # `<state_dir>/<experiment_id>/`), so they must not be able to carry path separators or `..`.
@@ -59,6 +61,12 @@ class ExperimentCreateRequest(BaseModel):
     batch_size: int = Field(default=16, ge=1, le=500)
     max_batches: int = Field(default=20, ge=1, le=1000)
     budget: ExperimentBudget | None = None
+    # What the search evolves from: "champion" (the genome in production, else the original),
+    # "original" (v1), or a specific genome as a hash or `<system>@v<N>`.
+    baseline: Annotated[str, StringConstraints(min_length=1, max_length=128)] = "champion"
+    # Per-experiment overrides of the promotion gates and safety limits (defaults apply when omitted).
+    promotion_gates: PromotionGateConfig | None = None
+    safety_constraints: SafetyConstraints | None = None
 
     _domain = field_validator("domain")(_known_domain)
 
@@ -78,6 +86,10 @@ class PromotionRequest(BaseModel):
 class PromoteRequest(BaseModel):
     genome_hash: Annotated[str, StringConstraints(min_length=1, max_length=64)]
     experiment_id: Identifier | None = None
+
+
+class RollbackRequest(BaseModel):
+    system_id: Identifier
 
 
 class CanaryRequest(BaseModel):

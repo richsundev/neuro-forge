@@ -15,6 +15,7 @@ from neuroforge.db.repository import (
     dataset_for_experiment,
     get_dataset_version,
     get_experiment,
+    get_genome,
     list_genomes_for_system,
     save_experiment,
     save_genome,
@@ -41,6 +42,21 @@ class UnknownExperiment(RunnerError):
     pass
 
 
+def _baseline_for_run(session, application_id: str, config: ExperimentConfig) -> SystemGenome | None:
+    """The genome the search starts from: the one recorded on the experiment, or — for experiments
+    created before baselines were recorded — the application's v1."""
+    if config.baseline_hash:
+        return get_genome(session, config.baseline_hash)
+    return next(
+        (
+            SystemGenome.model_validate(r.data)
+            for r in list_genomes_for_system(session, application_id)
+            if r.version == 1
+        ),
+        None,
+    )
+
+
 def _dataset_for_run(session, application_id: str, config: ExperimentConfig, experiment_id: str, state_root: Path):
     """A first run uses the dataset's latest version; a *resumed* run must keep the version its
     checkpoint started on, even if the dataset has been evolved since."""
@@ -58,14 +74,7 @@ def run_recorded_experiment(experiment_id: str, state_root: Path) -> ExperimentR
             raise UnknownExperiment(f"unknown experiment '{experiment_id}'")
         config = ExperimentConfig.model_validate(record.config)
         application_id = record.application_id
-        baseline = next(
-            (
-                SystemGenome.model_validate(r.data)
-                for r in list_genomes_for_system(session, application_id)
-                if r.version == 1
-            ),
-            None,
-        )
+        baseline = _baseline_for_run(session, application_id, config)
         dataset = _dataset_for_run(session, application_id, config, experiment_id, state_root)
 
     if baseline is None or dataset is None:

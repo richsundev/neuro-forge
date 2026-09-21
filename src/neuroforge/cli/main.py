@@ -18,9 +18,7 @@ from neuroforge.db.repository import (
     genome_from_record,
     get_experiment,
     get_genome,
-    latest_canary_run,
     latest_dataset_version,
-    latest_promotion_decision,
     list_experiments,
     list_genomes_for_system,
     next_candidate_version,
@@ -28,8 +26,6 @@ from neuroforge.db.repository import (
     save_dataset_version,
     save_experiment,
     save_genome,
-    save_promotion_approval,
-    set_genome_status,
     upsert_application,
 )
 from neuroforge.db.session import init_db, session_scope
@@ -43,6 +39,13 @@ from neuroforge.experiments.spaces import search_space_for_domain
 from neuroforge.genomes.schema import PromotionStatus, SystemGenome
 from neuroforge.optimization import STRATEGY_REGISTRY
 from neuroforge.promotion.canary import fresh_traffic, simulate_canary
+from neuroforge.promotion.lifecycle import (
+    ProductionError,
+    current_champion,
+    promote_to_production,
+    resolve_baseline,
+    rollback_production,
+)
 from neuroforge.promotion.review import ReviewError, review_promotion
 from neuroforge.providers.registry import get_provider
 from neuroforge.util import stable_int
@@ -113,9 +116,12 @@ def app_list() -> None:
 
     with session_scope() as session:
         rows = list(session.scalars(select(ApplicationRecord)))
-    table = Table("id", "name", "domain", "created_at")
+        champions = {r.id: current_champion(session, r.id) for r in rows}
+    table = Table("id", "name", "domain", "in production", "created_at")
     for r in rows:
-        table.add_row(r.id, r.name, r.domain_name, str(r.created_at))
+        champion = champions[r.id]
+        production = f"v{champion.version} ({champion.hash})" if champion else "original (v1)"
+        table.add_row(r.id, r.name, r.domain_name, production, str(r.created_at))
     console.print(table)
 
 
@@ -202,6 +208,11 @@ def experiment_create(
     batch_size: int = 16,
     max_batches: int = 20,
     max_candidates: int = 200,
+    baseline: str = typer.Option(
+        "champion",
+        help='what to evolve from: "champion" (current production genome, else the original), '
+        '"original" (v1), or a genome hash / <system>@v<N>',
+    ),
 ) -> None:
     dataset_id = dataset_id or f"{system_id}-dataset"
     d = _domain_or_error(domain)
@@ -211,10 +222,15 @@ def experiment_create(
         if get_experiment(session, experiment_id) is not None:
             raise typer.BadParameter(f"experiment '{experiment_id}' already exists")
         upsert_application(session, system_id, system_id, domain)
-        baseline = get_genome_by_system_version(session, system_id, 1)
-        if baseline is None:
-            baseline = SystemGenome(system_id=system_id, version=1)
-            save_genome(session, baseline)
+        if get_genome_by_system_version(session, system_id, 1) is None:
+            save_genome(session, SystemGenome(system_id=system_id, version=1))
+            session.flush()  # sessions here don't autoflush; the baseline lookup below must see it
+        try:
+            baseline_record = resolve_baseline(session, system_id, baseline)
+        except ProductionError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        if baseline_record is None:
+            raise typer.BadParameter(f"no baseline genome for '{system_id}'")
         dataset = latest_dataset_version(session, dataset_id)
         if dataset is None:
             dataset = seed_dataset(d, dataset_id, n=300, seed=seed)
@@ -226,6 +242,7 @@ def experiment_create(
             experiment_id=experiment_id,
             domain_name=domain,
             dataset_id=dataset_id,
+            baseline_hash=baseline_record.hash,
             first_candidate_version=next_candidate_version(session, system_id),
             search_strategy=strategy,
             search_space=search_space_for_domain(domain),
@@ -235,7 +252,10 @@ def experiment_create(
             budget=ExperimentBudget(max_candidates=max_candidates, max_requests=1_000_000, max_cost_usd=100, max_duration_minutes=60),
         )
         save_experiment(session, system_id, config, status="created")
-    console.print(f"[green]created experiment[/] {experiment_id} (system={system_id}, dataset={dataset_id})")
+    console.print(
+        f"[green]created experiment[/] {experiment_id} (system={system_id}, dataset={dataset_id}, "
+        f"baseline=v{baseline_record.version} {baseline_record.hash})"
+    )
 
 
 def get_genome_by_system_version(session, system_id: str, version: int) -> SystemGenome | None:
@@ -381,20 +401,30 @@ def promotion_promote(genome_hash: str, experiment_id: str | None = None) -> Non
     reason: this is the one step meant to need an explicit, attributable human action."""
     approved_by = os.environ.get("USER", "cli")
     with session_scope() as session:
-        current = get_genome(session, genome_hash)
-        if current is not None and current.status == PromotionStatus.PROMOTED:
-            raise typer.BadParameter("this genome is already promoted")
-        decision = latest_promotion_decision(session, genome_hash)
-        if decision is None or not decision.approved:
-            raise typer.BadParameter("no approved promotion decision on record for this genome")
-        canary = latest_canary_run(session, genome_hash)
-        if canary is None:
-            raise typer.BadParameter("no canary run on record for this genome — run a canary before promoting")
-        if canary.rollback_triggered:
-            raise typer.BadParameter("the latest canary run triggered a rollback — cannot promote")
-        set_genome_status(session, genome_hash, PromotionStatus.PROMOTED.value)
-        save_promotion_approval(session, genome_hash, experiment_id, approved_by)
+        try:
+            outcome = promote_to_production(session, genome_hash, experiment_id, approved_by)
+        except ProductionError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        superseded = outcome.superseded.hash if outcome.superseded else None
     console.print(f"status={PromotionStatus.PROMOTED.value} approved_by={approved_by}")
+    if superseded:
+        console.print(f"superseded previous champion {superseded} (restore it with `promotion rollback`)")
+
+
+@promotion_cmd.command("rollback")
+def promotion_rollback(system_id: str) -> None:
+    """Take the application's current champion out of production and restore the one it replaced
+    (or the original baseline, if it was the first). Mirrors POST /api/v1/promotions/rollback."""
+    approved_by = os.environ.get("USER", "cli")
+    with session_scope() as session:
+        try:
+            outcome = rollback_production(session, system_id, approved_by)
+        except ProductionError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        rolled_back = outcome.rolled_back.hash
+        restored = outcome.restored.hash if outcome.restored else None
+    console.print(f"rolled back {rolled_back} (by {approved_by})")
+    console.print(f"production is now {restored or 'the original baseline'}")
 
 
 # --- canary --------------------------------------------------------------

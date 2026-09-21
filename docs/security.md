@@ -10,7 +10,7 @@ Roles are ordered `viewer < operator < admin`:
 |---|---|
 | viewer | read everything |
 | operator | create/run/cancel experiments, seed and evolve datasets, request promotion, run canaries |
-| admin | everything above, create API keys, and take a candidate to `PROMOTED` |
+| admin | everything above, create API keys, take a candidate to `PROMOTED`, and roll production back |
 
 ## Throttling
 

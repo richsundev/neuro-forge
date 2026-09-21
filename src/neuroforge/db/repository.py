@@ -305,11 +305,34 @@ def set_genome_status(session: Session, genome_hash: str, status: str) -> Genome
 
 
 def save_promotion_approval(
-    session: Session, genome_hash: str, experiment_id: str | None, approved_by: str
+    session: Session,
+    genome_hash: str,
+    experiment_id: str | None,
+    approved_by: str,
+    action: str = "promote",
 ) -> PromotionApprovalRecord:
-    record = PromotionApprovalRecord(genome_hash=genome_hash, experiment_id=experiment_id, approved_by=approved_by)
+    record = PromotionApprovalRecord(
+        genome_hash=genome_hash, experiment_id=experiment_id, approved_by=approved_by, action=action
+    )
     session.add(record)
     return record
+
+
+def get_genome_record(session: Session, genome_hash: str) -> GenomeRecord | None:
+    return session.get(GenomeRecord, genome_hash)
+
+
+def list_production_events(
+    session: Session, system_id: str | None = None
+) -> list[tuple[PromotionApprovalRecord, GenomeRecord]]:
+    """Every promote/rollback action, oldest first, with the genome it acted on."""
+    stmt = select(PromotionApprovalRecord, GenomeRecord).join(
+        GenomeRecord, GenomeRecord.hash == PromotionApprovalRecord.genome_hash
+    )
+    if system_id is not None:
+        stmt = stmt.where(GenomeRecord.system_id == system_id)
+    stmt = stmt.order_by(PromotionApprovalRecord.created_at, PromotionApprovalRecord.id)
+    return [(row[0], row[1]) for row in session.execute(stmt)]
 
 
 def list_promotion_approvals(session: Session) -> list[PromotionApprovalRecord]:

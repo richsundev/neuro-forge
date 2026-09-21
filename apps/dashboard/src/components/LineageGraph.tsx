@@ -13,6 +13,7 @@ const STATUS_COLOR: Record<string, string> = {
   PROMOTED: "#16a34a",
   REJECTED: "#ef4444",
   ROLLED_BACK: "#b91c1c",
+  SUPERSEDED: "#0d9488",
 };
 
 const COL_WIDTH = 170;
@@ -23,26 +24,39 @@ export default function LineageGraph({ graph }: { graph: LineageGraphData }) {
   const [selected, setSelected] = useState<LineageNode | null>(null);
 
   const { positioned, width, height } = useMemo(() => {
-    const byGeneration = new Map<number, LineageNode[]>();
-    for (const node of graph.nodes) {
-      const arr = byGeneration.get(node.generation) ?? [];
-      arr.push(node);
-      byGeneration.set(node.generation, arr);
+    const generations = [...new Set(graph.nodes.map((n) => n.generation))].sort((a, b) => a - b);
+    const column = new Map(generations.map((g, i) => [g, i]));
+
+    // Lanes: a node continues its parent's lane if it is the parent's first child, and opens a new
+    // lane otherwise. Placing every node of a generation in one column by index (the old layout)
+    // stacked unrelated branches into a single row, so a branch off the champion looked like a
+    // continuation of the previous branch.
+    const ordered = [...graph.nodes].sort((a, b) => a.generation - b.generation || a.version - b.version);
+    const laneOf = new Map<string, number>();
+    const childrenSeen = new Map<string, number>();
+    const occupied = new Set<string>();
+    let nextLane = 0;
+    for (const node of ordered) {
+      const parentLane = node.parent_hash ? laneOf.get(node.parent_hash) : undefined;
+      const seen = node.parent_hash ? (childrenSeen.get(node.parent_hash) ?? 0) : 0;
+      let lane = parentLane !== undefined && seen === 0 ? parentLane : nextLane++;
+      while (occupied.has(`${node.generation}:${lane}`)) lane = nextLane++;
+      if (node.parent_hash) childrenSeen.set(node.parent_hash, seen + 1);
+      occupied.add(`${node.generation}:${lane}`);
+      laneOf.set(node.hash, lane);
     }
-    const generations = [...byGeneration.keys()].sort((a, b) => a - b);
+
     const positioned = new Map<string, { x: number; y: number; node: LineageNode }>();
     let maxRow = 0;
-    generations.forEach((gen, colIdx) => {
-      const nodes = byGeneration.get(gen)!.sort((a, b) => a.version - b.version);
-      nodes.forEach((node, rowIdx) => {
-        positioned.set(node.hash, {
-          x: 60 + colIdx * COL_WIDTH,
-          y: 50 + rowIdx * ROW_HEIGHT,
-          node,
-        });
-        maxRow = Math.max(maxRow, rowIdx);
+    for (const node of ordered) {
+      const row = laneOf.get(node.hash) ?? 0;
+      positioned.set(node.hash, {
+        x: 60 + (column.get(node.generation) ?? 0) * COL_WIDTH,
+        y: 50 + row * ROW_HEIGHT,
+        node,
       });
-    });
+      maxRow = Math.max(maxRow, row);
+    }
     return {
       positioned,
       width: 120 + generations.length * COL_WIDTH,
@@ -92,6 +106,14 @@ export default function LineageGraph({ graph }: { graph: LineageGraphData }) {
             </g>
           ))}
         </svg>
+        <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-slate-200 px-3 py-2 text-xs text-slate-500">
+          {Object.entries(STATUS_COLOR).map(([status, color]) => (
+            <span key={status} className="inline-flex items-center gap-1">
+              <span className="inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: color }} />
+              {status.toLowerCase().replace("_", " ")}
+            </span>
+          ))}
+        </div>
       </div>
       <div className="card w-72 shrink-0">
         {selected ? (
