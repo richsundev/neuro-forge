@@ -584,3 +584,50 @@ def test_the_engine_refuses_to_resume_on_a_different_dataset_version(baseline_ge
     evolved = small_dataset.model_copy(update={"version": small_dataset.version + 1})
     with pytest.raises(DatasetChanged):
         ExperimentEngine(_config("random", 16), baseline_genome, evolved, tmp_path).run()
+
+
+def test_evolving_a_dataset_uses_its_own_domain_not_a_caller_supplied_default(client):
+    """Evolving a research-agent dataset without saying so used the default domain and mixed
+    ForgeSupport challenges into it."""
+    c, h = client
+    c.post("/api/v1/datasets", json={"dataset_id": "r", "domain": "research-agent", "n": 40, "seed": 1}, headers=h)
+    evolved = c.post("/api/v1/datasets/r/evolve", json={"mean_score": 0.95, "n_new": 10}, headers=h)
+    assert evolved.status_code == 200 and evolved.json()["version"] == 2
+    from neuroforge.db.repository import latest_dataset_version
+    from neuroforge.db.session import session_scope
+
+    with session_scope() as session:
+        dataset = latest_dataset_version(session, "r")
+    assert {c.challenge_id.split("-")[0] for c in dataset.challenges} == {"ra"}
+    mismatch = c.post("/api/v1/datasets/r/evolve", json={"mean_score": 0.95, "domain": "sql-agent"}, headers=h)
+    assert mismatch.status_code == 400
+
+
+def test_simultaneous_creates_of_one_experiment_are_a_conflict_not_a_server_error(client):
+    import threading
+
+    c, h = client
+    c.post("/api/v1/applications", json={"id": "app", "name": "a", "domain": "forge-support"}, headers=h)
+    c.post("/api/v1/datasets", json={"dataset_id": "app-dataset", "n": 40, "seed": 1}, headers=h)
+    codes: list[int] = []
+    barrier = threading.Barrier(5)
+
+    def create() -> None:
+        barrier.wait()
+        codes.append(c.post("/api/v1/experiments", json=_experiment("racy"), headers=h).status_code)
+
+    threads = [threading.Thread(target=create) for _ in range(5)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sorted(codes) == [200, 409, 409, 409, 409]
+
+
+def test_failure_driven_evolution_through_the_api(client):
+    c, h = client
+    c.post("/api/v1/datasets", json={"dataset_id": "d", "n": 60, "seed": 1}, headers=h)
+    ok = c.post("/api/v1/datasets/d/evolve", json={"failing_categories": ["refund_request"], "n_new": 10}, headers=h)
+    assert ok.status_code == 200 and ok.json()["version"] == 2  # no saturation needed
+    listed = [d for d in c.get("/api/v1/datasets", headers=h).json() if d["dataset_id"] == "d"]
+    assert {d["source"] for d in listed} == {"seed", "failure_driven"}
+    assert c.post("/api/v1/datasets/d/evolve", json={"failing_categories": ["nope"]}, headers=h).status_code == 400
+    assert c.post("/api/v1/datasets/d/evolve", json={"n_new": 5}, headers=h).status_code == 400  # neither mode chosen

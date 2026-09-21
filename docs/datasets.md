@@ -48,7 +48,16 @@ this implements.
 `failure_driven_challenges()` generates new challenges concentrated on categories a candidate is
 currently failing, rather than uniformly across all categories — turning an observed failure mode
 into targeted evaluation material (mirrors the "agent incorrectly issued refund → generate more
-refund-edge-case challenges" example from the brief).
+refund-edge-case challenges" example from the brief). It returns exactly `n` challenges of the
+requested categories (at the hard end of the difficulty range) and fails loudly for a category the
+domain doesn't have. `evolve_from_failures()` turns that into a new dataset version
+(`source="failure_driven"`) with the same guarantees as saturation-driven evolution: existing
+challenges keep their splits and new ids are unique.
+
+It is exposed as `POST /api/v1/datasets/{id}/evolve` with `failing_categories` (no `mean_score`
+needed) and `neuroforge dataset evolve --failing-category <name>` (repeatable). Choosing the categories
+is left to the caller — read them off an experiment's per-category quality — rather than inferred
+automatically.
 
 ## Adversarial categories (ForgeSupport)
 

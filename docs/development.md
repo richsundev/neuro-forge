@@ -54,15 +54,18 @@ Being direct about the gap between this reference implementation and a productio
   EFS/Filestore/NFS or should move checkpoints/events into the database instead.
 - **Celery-grade worker features**: the Redis queue (`experiments/queue.py`) has no retry-with-
   backoff, no dead-letter queue, no task priorities, no distributed tracing across queue hops. See
-  ADR-0009 for why a plain queue was chosen anyway, and what a production upgrade path looks like.
-- **Human approval gate**: nothing currently blocks `APPROVED -> CANARY -> PROMOTED` on human
-  sign-off; a real deployment pipeline should require it, at minimum for `CANARY -> PROMOTED`.
+  ADR-0010 for why a plain queue was chosen anyway, and what a production upgrade path looks like.
+- **Human approval gate**: implemented (`POST /promotions/finalize`, admin-only, attributed and
+  logged) along with a champion/challenger lifecycle and rollback — see docs/promotion.md. What a
+  real pipeline still adds is a second approver or an external change-management ticket.
 - **Multi-instance rate limiting**: `apps/api/neuroforge_api/auth.py`'s `RateLimiter` is an
   in-memory token bucket — correct for one process, not shared across horizontally-scaled API
   replicas. Production needs Redis-backed rate limiting.
-- **Alembic migrations beyond the initial schema**: only one migration exists
-  (`c8fc232e2891_initial_schema.py`); schema evolution beyond this point needs new migrations
-  generated the normal way (`alembic revision --autogenerate`).
+- **Schema changes go through Alembic.** `migrations/versions/` holds the chain (initial schema,
+  promotion approvals, holdout evaluations, approval actions); new changes are generated with
+  `alembic revision --autogenerate` and checked with `alembic check` against Postgres. Separately,
+  `init_db()` adds *nullable* columns missing from an older local SQLite file so a stale database keeps
+  working — it deliberately refuses NOT NULL additions, which need a real migration.
 - **Real provider cost/latency calibration**: `providers/compatible.py`'s OpenAI/Anthropic
   adapters are structurally complete but don't populate `capability_signal`/cost the way the mock
   provider does (real providers return usage/cost data differently per vendor) — evaluators that

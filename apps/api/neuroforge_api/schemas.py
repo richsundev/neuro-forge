@@ -43,12 +43,23 @@ class DatasetSeedRequest(BaseModel):
 
 
 class DatasetEvolveRequest(BaseModel):
-    mean_score: float = Field(ge=0.0, le=1.0)
-    domain: str = "forge-support"
+    # Saturation-driven evolution: the dataset is extended (harder) only if this mean score is high
+    # enough. Required unless `failing_categories` is given.
+    mean_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Failure-driven evolution: add challenges concentrated on these categories, regardless of
+    # saturation (`source="failure_driven"`).
+    failing_categories: list[Annotated[str, StringConstraints(min_length=1, max_length=64)]] | None = Field(
+        default=None, min_length=1, max_length=20
+    )
+    # Optional: the dataset already knows its domain. If given it must match.
+    domain: str | None = None
     n_new: int = Field(default=30, ge=1, le=1000)
     seed: int = 2
 
-    _domain = field_validator("domain")(_known_domain)
+    @field_validator("domain")
+    @classmethod
+    def _known_optional_domain(cls, value: str | None) -> str | None:
+        return None if value is None else _known_domain(value)
 
 
 class ExperimentCreateRequest(BaseModel):

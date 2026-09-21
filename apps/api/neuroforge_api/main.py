@@ -21,8 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CollectorRegistry, Counter, Histogram, generate_latest
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
-from neuroforge.datasets.evolution import evolve_if_saturated, seed_dataset
+from neuroforge.datasets.evolution import evolve_from_failures, evolve_if_saturated, seed_dataset
 from neuroforge.db.models import ApiKeyRecord, ApplicationRecord, DatasetVersionRecord, GenomeRecord
 from neuroforge.db.repository import (
     genome_from_record,
@@ -61,9 +62,11 @@ from neuroforge.promotion.lifecycle import (
     ProductionError,
     current_champion,
     original_baseline,
+    production_lock,
     promote_to_production,
     resolve_baseline,
     rollback_production,
+    system_of_genome,
 )
 from neuroforge.promotion.review import ReviewError, review_promotion
 from neuroforge.providers.registry import get_provider
@@ -204,8 +207,7 @@ def _resolve_genome(session, ident: str) -> SystemGenome:
 def _domain_for_dataset(dataset) -> str:
     if not dataset.challenges:
         raise HTTPException(400, f"dataset '{dataset.dataset_id}' has no challenges")
-    prefix = dataset.challenges[0].challenge_id.split("-")[0]
-    return {"fs": "forge-support", "sql": "sql-agent", "ra": "research-agent"}.get(prefix, "forge-support")
+    return dataset.domain_name
 
 
 def _production_summary(session, system_id: str) -> dict | None:
@@ -317,6 +319,13 @@ def genome_lineage(system_id: str, principal: Principal = Depends(require_role("
 
 @app.post("/api/v1/datasets", tags=["datasets"])
 def seed_dataset_endpoint(body: DatasetSeedRequest, principal: Principal = Depends(require_role("operator"))) -> dict:
+    try:
+        return _seed_dataset(body, principal)
+    except IntegrityError as exc:  # a concurrent identical seed won the race on the unique hash
+        raise HTTPException(409, f"dataset '{body.dataset_id}' is being created by another request") from exc
+
+
+def _seed_dataset(body: DatasetSeedRequest, principal: Principal) -> dict:
     domain = get_domain(body.domain)
     dataset = seed_dataset(domain, body.dataset_id, n=body.n, seed=body.seed)
     with session_scope() as session:
@@ -353,15 +362,30 @@ def list_datasets(principal: Principal = Depends(require_role("viewer"))) -> lis
 def evolve_dataset_endpoint(
     dataset_id: str, body: DatasetEvolveRequest, principal: Principal = Depends(require_role("operator"))
 ) -> dict:
-    domain = get_domain(body.domain)
     with session_scope() as session:
         current = latest_dataset_version(session, dataset_id)
         if current is None:
             raise HTTPException(404, f"no dataset version found for '{dataset_id}'")
-        evolved = evolve_if_saturated(domain, current, body.mean_score, body.n_new, body.seed)
+        dataset_domain = _domain_for_dataset(current)
+        if body.domain is not None and body.domain != dataset_domain:
+            raise HTTPException(400, f"dataset '{dataset_id}' belongs to domain '{dataset_domain}', not '{body.domain}'")
+        domain = get_domain(dataset_domain)
+        if body.failing_categories:
+            try:
+                evolved = evolve_from_failures(domain, current, body.failing_categories, body.n_new, body.seed)
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        elif body.mean_score is None:
+            raise HTTPException(400, "give either mean_score (saturation-driven) or failing_categories (failure-driven)")
+        else:
+            evolved = evolve_if_saturated(domain, current, body.mean_score, body.n_new, body.seed)
         if evolved is None:
             return {"evolved": False, "reason": "benchmark not yet saturated"}
-        save_dataset_version(session, evolved)
+        stored = save_dataset_version(session, evolved)
+        if stored.dataset_hash != evolved.hash():
+            # A concurrent evolution already created this version with different content; returning
+            # our summary would describe a dataset that isn't the one stored.
+            raise HTTPException(409, f"dataset '{dataset_id}' v{evolved.version} was created concurrently; retry")
     audit(principal.name, "evolve_dataset", {"dataset_id": dataset_id, "new_version": evolved.version})
     return {"evolved": True, **evolved.summary()}
 
@@ -371,6 +395,15 @@ def evolve_dataset_endpoint(
 
 @app.post("/api/v1/experiments", tags=["experiments"])
 def create_experiment(body: ExperimentCreateRequest, principal: Principal = Depends(require_role("operator"))) -> dict:
+    try:
+        return _create_experiment(body, principal)
+    except IntegrityError as exc:
+        # Two simultaneous creates both pass the "already exists" check; the primary key makes the
+        # loser fail at commit, which should read as the conflict it is, not as a server error.
+        raise HTTPException(409, f"experiment '{body.experiment_id}' already exists") from exc
+
+
+def _create_experiment(body: ExperimentCreateRequest, principal: Principal) -> dict:
     dataset_id = body.dataset_id or f"{body.system_id}-dataset"
     domain = get_domain(body.domain)
     with session_scope() as session:
@@ -662,12 +695,14 @@ def finalize_promotion(body: PromoteRequest, principal: Principal = Depends(requ
     is recorded in `promotion_approvals` against the caller's own name so it's always attributable
     to a specific person, not just "the pipeline". The genome becomes the application's champion;
     the previous champion is marked SUPERSEDED (and can be restored by a rollback)."""
-    with session_scope() as session:
-        try:
+    try:
+        with session_scope() as session:
+            system_id = system_of_genome(session, body.genome_hash)
+        with production_lock(system_id), session_scope() as session:
             outcome = promote_to_production(session, body.genome_hash, body.experiment_id, principal.name)
-        except ProductionError as exc:
-            raise HTTPException(_PRODUCTION_STATUS[exc.kind], str(exc)) from exc
-        superseded = outcome.superseded.hash if outcome.superseded else None
+            superseded = outcome.superseded.hash if outcome.superseded else None
+    except ProductionError as exc:
+        raise HTTPException(_PRODUCTION_STATUS[exc.kind], str(exc)) from exc
     audit(principal.name, "finalize_promotion", {"genome_hash": body.genome_hash, "superseded": superseded})
     return {
         "genome_hash": body.genome_hash,
@@ -681,13 +716,13 @@ def finalize_promotion(body: PromoteRequest, principal: Principal = Depends(requ
 def rollback_promotion(body: RollbackRequest, principal: Principal = Depends(require_role("admin"))) -> dict:
     """Take the current champion out of production and restore the one it replaced (or, if it was the
     first, go back to the original baseline). Admin-only and logged, like promoting."""
-    with session_scope() as session:
-        try:
+    try:
+        with production_lock(body.system_id), session_scope() as session:
             outcome = rollback_production(session, body.system_id, principal.name)
-        except ProductionError as exc:
-            raise HTTPException(_PRODUCTION_STATUS[exc.kind], str(exc)) from exc
-        rolled_back = outcome.rolled_back.hash
-        restored = outcome.restored.hash if outcome.restored else None
+            rolled_back = outcome.rolled_back.hash
+            restored = outcome.restored.hash if outcome.restored else None
+    except ProductionError as exc:
+        raise HTTPException(_PRODUCTION_STATUS[exc.kind], str(exc)) from exc
     audit(principal.name, "rollback_production", {"system_id": body.system_id, "rolled_back": rolled_back, "restored": restored})
     return {"system_id": body.system_id, "rolled_back": rolled_back, "restored": restored, "approved_by": principal.name}
 

@@ -11,11 +11,21 @@ Deliberately not imported by `neuroforge.promotion.__init__`: it depends on the 
 
 from __future__ import annotations
 
+import os
+import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from neuroforge.db.models import GenomeRecord
+try:  # POSIX only; elsewhere production changes are simply not mutually excluded
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
+from neuroforge.db.models import ApplicationRecord, GenomeRecord
 from neuroforge.db.repository import (
     get_experiment,
     get_genome_record,
@@ -87,6 +97,67 @@ def production_stack(session: Session, system_id: str) -> list[GenomeRecord]:
         if (approval.action or "promote") == "promote":
             stack.append(genome)
     return stack
+
+
+def reconcile_production_statuses(session: Session, system_id: str) -> None:
+    """Make `system_genomes.status` agree with the approval log for every genome that has been in
+    production: the champion is PROMOTED, earlier stack members SUPERSEDED, and genomes that were
+    rolled back ROLLED_BACK. The log is authoritative, so this is safe to run after any write — and
+    it repairs a status cache that a concurrent promotion or an older code path left inconsistent."""
+    events = list_production_events(session, system_id)
+    stack = production_stack(session, system_id)
+    in_stack = {g.hash for g in stack}
+    for index, genome in enumerate(stack):
+        wanted = PromotionStatus.PROMOTED if index == len(stack) - 1 else PromotionStatus.SUPERSEDED
+        if genome.status != wanted.value:
+            set_genome_status(session, genome.hash, wanted.value)
+    for _approval, genome in events:
+        # Out of production. Only PROMOTED/SUPERSEDED are stale here; a later review or canary may
+        # legitimately have moved a rolled-back genome on to APPROVED/CANARY/REJECTED.
+        if genome.hash not in in_stack and genome.status in (
+            PromotionStatus.PROMOTED.value,
+            PromotionStatus.SUPERSEDED.value,
+        ):
+            set_genome_status(session, genome.hash, PromotionStatus.ROLLED_BACK.value)
+
+
+@contextmanager
+def production_lock(system_id: str) -> Iterator[None]:
+    """Hold an exclusive lock for one application's production changes, around the *whole*
+    transaction (take it before opening the session, release it after commit).
+
+    Reading the champion, checking the candidate against it, and writing the approval have to happen
+    as one step: with six concurrent promotions of candidates validated against the same baseline,
+    every one of them read "nothing is in production yet", passed the stale-baseline check, and got
+    promoted — five stale promotions slipped through. An advisory `flock` on the shared state
+    directory serializes them across threads and processes (the row lock below only helps Postgres)."""
+    if fcntl is None:  # pragma: no cover
+        yield
+        return
+    root = Path(os.environ.get("NEUROFORGE_STATE_DIR", "./neuroforge_state"))
+    root.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", system_id)
+    with (root / f".production-{safe}.lock").open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def system_of_genome(session: Session, genome_hash: str) -> str:
+    genome = get_genome_record(session, genome_hash)
+    if genome is None:
+        raise UnknownGenome(f"unknown genome '{genome_hash}'")
+    return genome.system_id
+
+
+def _lock_application(session: Session, system_id: str) -> None:
+    """Serialize production changes for one application. Two admins promoting at once each read the
+    champion before either wrote, so both "superseded" the same one and both ended up PROMOTED. The
+    row lock (a no-op on SQLite, where writes are already serialized per database) makes the second
+    wait and see the first's result."""
+    session.get(ApplicationRecord, system_id, with_for_update=True)
 
 
 def current_champion(session: Session, system_id: str) -> GenomeRecord | None:
@@ -165,6 +236,8 @@ def promote_to_production(
     genome = get_genome_record(session, genome_hash)
     if genome is None:
         raise UnknownGenome(f"unknown genome '{genome_hash}'")
+    _lock_application(session, genome.system_id)
+    session.refresh(genome)
     if genome.status == PromotionStatus.PROMOTED.value:
         # Otherwise a second click (or a retry) recorded a second approval for the same action.
         raise AlreadyPromoted("this genome is already promoted")
@@ -180,21 +253,20 @@ def promote_to_production(
 
     previous = current_champion(session, genome.system_id)
     save_promotion_approval(session, genome_hash, experiment_id, approved_by, action="promote")
-    set_genome_status(session, genome_hash, PromotionStatus.PROMOTED.value)
-    if previous is not None and previous.hash != genome_hash:
-        set_genome_status(session, previous.hash, PromotionStatus.SUPERSEDED.value)
+    session.flush()  # sessions here don't autoflush; the reconcile below replays the log
+    reconcile_production_statuses(session, genome.system_id)
     return PromotionOutcome(promoted=genome, superseded=previous if previous and previous.hash != genome_hash else None)
 
 
 def rollback_production(session: Session, system_id: str, approved_by: str) -> RollbackOutcome:
+    _lock_application(session, system_id)
     stack = production_stack(session, system_id)
     if not stack:
         raise NothingInProduction(f"'{system_id}' has no promoted genome to roll back")
     current = stack[-1]
     restored = stack[-2] if len(stack) >= 2 else None
     save_promotion_approval(session, current.hash, None, approved_by, action="rollback")
-    set_genome_status(session, current.hash, PromotionStatus.ROLLED_BACK.value)
-    if restored is not None:
-        set_genome_status(session, restored.hash, PromotionStatus.PROMOTED.value)
+    session.flush()
+    reconcile_production_statuses(session, system_id)
     return RollbackOutcome(rolled_back=current, restored=restored)
 

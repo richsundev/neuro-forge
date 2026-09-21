@@ -50,9 +50,16 @@ Each application has at most one **champion**, the genome in production:
   if its decision was made against a genome other than the current production genome, promoting it
   could replace a champion it never beat. Re-run the experiment from the current champion.
 
+Production changes are **serialized per application** (`lifecycle.production_lock`: an advisory `flock`
+on the state directory around the whole read-check-write transaction, plus a row lock on Postgres).
+Without it, six candidates validated against the same baseline and promoted at once each read "nothing
+is in production yet" and all six were promoted; now exactly one succeeds and the rest are refused as
+stale.
+
 The approval log (`promotion_approvals`, one row per promotion or rollback) is the source of truth;
 the champion and rollback history are replayed from it, and `system_genomes.status` is a cache for
-the UI.
+the UI, re-derived from the log after every change (`reconcile_production_statuses`), so a genome that has
+been in production keeps its SUPERSEDED/PROMOTED/ROLLED_BACK status even if it is reviewed again.
 
 ## Promotion review: what the decision is based on
 

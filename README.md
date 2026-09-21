@@ -134,14 +134,14 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 | Capability | Status | Where |
 |---|---|---|
 | Immutable, content-hashed, lineaged genomes | ✅ | `genomes/`, [ADR-0001](docs/adr/0001-immutable-system-genome.md) |
-| Mutation engine + safety policy | ✅ | `mutations/` |
+| Mutation safety policy (enforced on every search candidate) + `MutationEngine` incremental-delta generator (library API; the experiment engine searches via search-space points instead) | ✅ | `mutations/` |
 | Random / Grid / Evolutionary / Bayesian / Bandit search | ✅ | `optimization/`, [docs/optimization.md](docs/optimization.md) |
 | Multi-objective fitness + true Pareto frontier | ✅ | `evaluation/objectives.py`, `evaluation/pareto.py` |
 | Statistical comparison (paired bootstrap, effect size) | ✅ | `evaluation/statistics.py` |
-| Evaluator ensemble + disagreement detection | ✅ | `evaluation/judges.py` |
+| Evaluator ensemble + disagreement detection (library component — simulated judges, not wired into the search or promotion pipeline) | 🟡 | `evaluation/judges.py` |
 | Dataset versioning + holdout protection (evaluated once per candidate, persisted) | ✅ | `datasets/`, [docs/datasets.md](docs/datasets.md), [ADR-0014](docs/adr/0014-holdout-verified-promotion.md) |
 | Benchmark evolution (harder challenges on saturation) | ✅ | `datasets/evolution.py` |
-| Failure-driven challenge generation | ✅ | `datasets/evolution.py:failure_driven_challenges` |
+| Failure-driven challenge generation (`dataset evolve --failing-category`) | ✅ | `datasets/evolution.py:evolve_from_failures` |
 | Budget enforcement (candidates/requests/cost/time) | ✅ | `experiments/budget.py` |
 | Checkpoint + resume (bit-identical to uninterrupted run) | ✅ | `experiments/checkpoint.py`, [ADR-0008](docs/adr/0008-checkpoint-replay-tell-batches.md) |
 | Cross-process reproducibility (verified, not assumed) | ✅ | [docs/reproducibility.md](docs/reproducibility.md) |
@@ -175,7 +175,7 @@ Full writeup: [docs/architecture.md](docs/architecture.md).
 **Backend**: Python 3.12, FastAPI, Pydantic v2, SQLAlchemy 2.0, Alembic, PostgreSQL (SQLite for
 local/CI), Redis, NumPy/SciPy. **Frontend**: Next.js 14 (App Router), TypeScript (strict),
 Tailwind CSS, Recharts. **Infra**: Docker Compose, Kubernetes, GitHub Actions. **Testing**:
-pytest (140 tests), mypy (strict), Ruff, ESLint, tsc.
+pytest (148 tests), mypy (strict), Ruff, ESLint, tsc.
 
 ## Quick start
 
@@ -190,7 +190,7 @@ docker compose up --build
 # Option B — local dev
 uv venv --python 3.12 .venv && uv pip install -e ".[dev]" -e ./apps/api
 cd apps/dashboard && npm install && cd ../..
-make test              # 140 tests, mock mode, no external services, ~15s
+make test              # 148 tests, mock mode, no external services, ~20s
 make reproduce           # full reproducible experiment -> reproduce_output/
 ```
 

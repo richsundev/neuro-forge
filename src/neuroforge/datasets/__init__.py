@@ -1,5 +1,6 @@
 from neuroforge.datasets.dataset import DatasetVersion
 from neuroforge.datasets.evolution import (
+    evolve_from_failures,
     evolve_if_saturated,
     failure_driven_challenges,
     seed_dataset,
@@ -11,6 +12,7 @@ __all__ = [
     "HoldoutGuard",
     "HoldoutViolation",
     "deterministic_split",
+    "evolve_from_failures",
     "evolve_if_saturated",
     "failure_driven_challenges",
     "seed_dataset",

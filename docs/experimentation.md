@@ -103,4 +103,4 @@ directly — per-candidate detail isn't duplicated into the database (see ADR-00
 `scripts/worker.py` is an independent process that `BLPOP`s that list and runs
 `ExperimentEngine` exactly as the API's synchronous `/run` endpoint does. Both paths call the
 same `ExperimentEngine.run()` — the only difference is who calls it and when. See
-docs/design-decisions.md ADR-0009 for why this is a plain Redis queue rather than Celery.
+docs/design-decisions.md ADR-0010 for why this is a plain Redis queue rather than Celery.

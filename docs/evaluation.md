@@ -31,6 +31,13 @@ score, each with a small deterministic bias/noise profile. When their standard d
 `AGREEMENT_UNCERTAINTY_THRESHOLD`, the result is flagged `uncertain` — evaluation disagreement is
 surfaced, not silently resolved by picking the most favorable judge.
 
+**Status:** this is a tested library component, not part of the pipeline. The "judges" are simulated
+(each perturbs the deterministic quality score by a fixed bias and seeded noise), so their
+disagreement is synthetic by construction; feeding it into search or promotion would let made-up noise
+influence real decisions. It becomes meaningful once real LLM judges back it, at which point the
+natural wiring is an evidence line on the holdout review ("N% of holdout challenges flagged
+uncertain"). `search`, `promotion` and the API/CLI do not call it today.
+
 ## Aggregation
 
 `evaluation/aggregate.py:aggregate()` reduces a list of per-challenge `EvaluationResult`s to one

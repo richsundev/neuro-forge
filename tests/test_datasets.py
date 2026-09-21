@@ -57,3 +57,32 @@ def test_benchmark_does_not_evolve_when_not_saturated(forge_support_domain, smal
         forge_support_domain, small_dataset, mean_search_score=0.5, n_new_challenges=20, seed=5
     )
     assert result is None
+
+
+def test_failure_driven_generation_returns_exactly_n_of_the_requested_categories(forge_support_domain):
+    """It over-filtered: asking for 5 of one category returned 1, and when nothing matched it silently
+    returned untargeted challenges."""
+    from neuroforge.datasets.evolution import failure_driven_challenges
+
+    out = failure_driven_challenges(forge_support_domain, ["refund_request"], 5, seed=3)
+    assert len(out) == 5 and {c.category for c in out} == {"refund_request"}
+    out = failure_driven_challenges(forge_support_domain, ["escalation_case", "duplicate_charge"], 9, seed=3)
+    assert len(out) == 9 and {c.category for c in out} <= {"escalation_case", "duplicate_charge"}
+    assert len({c.challenge_id for c in out}) == 9
+    assert all(c.difficulty >= 0.5 for c in out)
+    with pytest.raises(ValueError, match="categories"):
+        failure_driven_challenges(forge_support_domain, ["no_such_category"], 3, seed=1)
+
+
+def test_failure_driven_evolution_adds_a_version_and_keeps_existing_splits(forge_support_domain):
+    from neuroforge.datasets.evolution import evolve_from_failures, seed_dataset
+
+    v1 = seed_dataset(forge_support_domain, "d", n=60, seed=1)
+    v2 = evolve_from_failures(forge_support_domain, v1, ["refund_request"], 12, seed=5)
+    assert v2.version == 2 and v2.source == "failure_driven" and len(v2.challenges) == 72
+    old_splits = {c.challenge_id: c.split for c in v1.challenges}
+    assert all(old_splits[c.challenge_id] == c.split for c in v2.challenges if c.challenge_id in old_splits)
+    new = [c for c in v2.challenges if c.challenge_id not in old_splits]
+    assert len(new) == 12 and {c.category for c in new} == {"refund_request"}
+    v3 = evolve_from_failures(forge_support_domain, v2, ["refund_request"], 12, seed=5)  # same seed again
+    assert len({c.challenge_id for c in v3.challenges}) == 84

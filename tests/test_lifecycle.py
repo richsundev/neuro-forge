@@ -219,3 +219,78 @@ def test_mutation_records_list_only_fields_that_differ_from_the_baseline(baselin
     assert best.mutations
     for m in best.mutations:
         assert list(m.old_value) != list(m.new_value) if isinstance(m.old_value, list | tuple) else m.old_value != m.new_value
+
+
+def test_a_review_never_changes_the_status_of_a_genome_that_has_been_in_production(client):
+    """Found by a model-based fuzz of the lifecycle: re-reviewing a SUPERSEDED champion (approved or
+    rejected) reset it to APPROVED/REJECTED, so the cache disagreed with the production history."""
+    from neuroforge.db.repository import save_promotion_decision
+    from neuroforge.db.session import session_scope
+    from neuroforge.genomes.schema import PromotionStatus
+    from neuroforge.promotion.gates import PromotionDecision
+
+    c, h = client
+    a = _run(c, h, "e1", 1)
+    _promote(c, h, a, "e1")
+    b = _run(c, h, "e2", 2)
+    if b["best"] == a["best"]:
+        pytest.skip("second search found no new winner")
+    _promote(c, h, b, "e2")
+    assert _statuses(c, h)[a["best"]] == "SUPERSEDED"
+    for approved, status in ((True, PromotionStatus.APPROVED), (False, PromotionStatus.REJECTED)):
+        with session_scope() as session:
+            save_promotion_decision(session, a["best"], "e1", PromotionDecision(approved=approved, next_status=status, reasons=["again"]))
+        assert _statuses(c, h)[a["best"]] == "SUPERSEDED"
+    # ...so the rollback still restores it as the champion.
+    assert c.post("/api/v1/promotions/rollback", json={"system_id": "app"}, headers=h).json()["restored"] == a["best"]
+    assert _statuses(c, h)[a["best"]] == "PROMOTED"
+
+
+def test_status_reconciliation_repairs_a_cache_that_disagrees_with_the_log(client):
+    """Two admins promoting at once each superseded the champion they had read, leaving two PROMOTED
+    genomes; the log says otherwise, and the log wins."""
+    from neuroforge.db.repository import set_genome_status
+    from neuroforge.db.session import session_scope
+    from neuroforge.promotion.lifecycle import reconcile_production_statuses
+
+    c, h = client
+    a = _run(c, h, "e1", 1)
+    _promote(c, h, a, "e1")
+    b = _run(c, h, "e2", 2)
+    if b["best"] == a["best"]:
+        pytest.skip("second search found no new winner")
+    _promote(c, h, b, "e2")
+    with session_scope() as session:
+        set_genome_status(session, a["best"], "PROMOTED")  # the race's stale write
+    assert list(_statuses(c, h).values()).count("PROMOTED") == 2
+    with session_scope() as session:
+        reconcile_production_statuses(session, "app")
+    statuses = _statuses(c, h)
+    assert statuses[b["best"]] == "PROMOTED" and statuses[a["best"]] == "SUPERSEDED"
+    assert list(statuses.values()).count("PROMOTED") == 1
+
+
+def test_concurrent_promotions_are_serialized(client):
+    """Six candidates validated against the same baseline, finalized at once: every request read
+    "nothing is in production yet", passed the stale-baseline check and was promoted — five stale
+    promotions slipped through. Exactly one may succeed; the rest must see it and be refused."""
+    import threading
+
+    c, h = client
+    runs = [_run(c, h, f"e{i}", i + 1, baseline="original") for i in range(5)]
+    for i, run in enumerate(runs):
+        _approve_and_canary(run["best"], f"e{i}")
+    codes: list[int] = []
+    barrier = threading.Barrier(len(runs))
+
+    def promote(i: int) -> None:
+        barrier.wait()
+        response = c.post("/api/v1/promotions/finalize", json={"genome_hash": runs[i]["best"], "experiment_id": f"e{i}"}, headers=h)
+        codes.append(response.status_code)
+
+    threads = [threading.Thread(target=promote, args=(i,)) for i in range(len(runs))]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sorted(codes) == [200, 409, 409, 409, 409]
+    assert list(_statuses(c, h).values()).count("PROMOTED") == 1
+    assert len(c.get("/api/v1/promotions/approvals", headers=h).json()) == 1

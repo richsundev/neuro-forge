@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from neuroforge.datasets.dataset import DatasetVersion
 from neuroforge.datasets.holdout import deterministic_split
-from neuroforge.domains.base import ApplicationDomain
+from neuroforge.domains.base import ApplicationDomain, Challenge
 
 SATURATION_THRESHOLD = 0.90
 DIFFICULTY_STEP = 0.18
@@ -33,15 +33,25 @@ def evolve_if_saturated(
 
     lo = min(0.95, current.difficulty_score + DIFFICULTY_STEP * 0.5)
     hi = min(1.0, current.difficulty_score + DIFFICULTY_STEP)
+    return _extend(
+        current,
+        [c for c in domain.generate_cases(n_new_challenges, (lo, hi), seed) if domain.validate(c)],
+        seed,
+        "benchmark_evolution",
+    )
+
+
+def _extend(
+    current: DatasetVersion, new_challenges: list[Challenge], seed: int, source: str
+) -> DatasetVersion:
+    """The next version of `current` with `new_challenges` added."""
     new_version = current.version + 1
-    new_challenges = domain.generate_cases(n_new_challenges, (lo, hi), seed)
-    valid = [c for c in new_challenges if domain.validate(c)]
 
     # Generated ids come from the seed, so evolving twice with the same seed (the API's default)
     # regenerates ids that already exist: duplicated challenges, silently double-counted.
     taken = {c.challenge_id for c in current.challenges}
     unique = []
-    for c in valid:
+    for c in new_challenges:
         cid = c.challenge_id
         if cid in taken:
             cid = f"{cid}-v{new_version}"
@@ -59,7 +69,7 @@ def evolve_if_saturated(
         dataset_id=current.dataset_id,
         version=new_version,
         parent_version=current.version,
-        source="benchmark_evolution",
+        source=source,
         challenges=combined,
         difficulty_score=round(difficulty_score, 4),
         validated=True,
@@ -91,11 +101,40 @@ def failure_driven_challenges(
     failing_categories: list[str],
     n: int,
     seed: int,
-) -> list:
-    """Generate targeted new challenges around categories where candidates are failing (section
-    12). Falls back to the domain's full category mix if no categories are specified."""
-    all_new = domain.generate_cases(n * max(1, len(failing_categories) or 1), (0.5, 0.95), seed)
+) -> list[Challenge]:
+    """Generate exactly `n` new challenges in the categories where candidates are failing (section
+    12), at the hard end of the difficulty range. With no categories, the domain's normal mix.
+
+    Generated cases cycle through *all* of a domain's categories, so asking for `n` and filtering
+    kept only ~n/8 of them — `n=5` for one category returned one challenge, and when nothing matched
+    the old code silently returned untargeted challenges instead. This over-generates (varying the
+    seed so ids stay distinct) until it has `n` of the requested categories, and fails loudly if a
+    category doesn't exist in the domain."""
+    if n < 1:
+        raise ValueError("n must be at least 1")
     if not failing_categories:
-        return all_new[:n]
-    targeted = [c for c in all_new if c.category in failing_categories]
-    return targeted[:n] or all_new[:n]
+        return domain.generate_cases(n, (0.5, 0.95), seed)
+    wanted = set(failing_categories)
+    found: list[Challenge] = []
+    for round_ in range(50):
+        batch = domain.generate_cases(max(n * 8, 16), (0.5, 0.95), seed + round_)
+        found.extend(c for c in batch if c.category in wanted and domain.validate(c))
+        if len(found) >= n:
+            return found[:n]
+    known = sorted({c.category for c in domain.generate_cases(64, (0.5, 0.95), seed)})
+    raise ValueError(f"could not generate challenges for categories {sorted(wanted)}; the domain has {known}")
+
+
+def evolve_from_failures(
+    domain: ApplicationDomain,
+    current: DatasetVersion,
+    failing_categories: list[str],
+    n_new: int,
+    seed: int,
+) -> DatasetVersion:
+    """A new dataset version with extra challenges concentrated on the categories a candidate is
+    failing (`source="failure_driven"`), turning an observed failure mode into evaluation material
+    without waiting for the whole benchmark to saturate."""
+    if not failing_categories:
+        raise ValueError("failing_categories must name at least one category")
+    return _extend(current, failure_driven_challenges(domain, failing_categories, n_new, seed), seed, "failure_driven")

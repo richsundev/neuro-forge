@@ -54,6 +54,12 @@ docs/experimentation.md). `tests/test_regressions.py::test_resume_reproduces_an_
 verifies this directly for all five strategies: stop at 8 candidates, resume to 24, and diff against
 a straight run to 24. (Replay covers `ask()` as well as `tell()` — see ADR-0008's correction.)
 
+The equivalence holds when the stopping point falls on a batch boundary (as in the test: 8, then 24,
+with batches of 8). The engine truncates the final batch to the candidates the budget has left, so
+stopping mid-batch (say at 10 with batches of 8) gives partial batches whose `tell()` boundaries differ
+from a straight run's — the resumed search is still valid and deterministic, just not identical to the
+uninterrupted one.
+
 ## What is and isn't covered
 
 - Covered: genome content, evaluation metrics, statistical conclusions, promotion/canary

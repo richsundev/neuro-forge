@@ -38,6 +38,17 @@ class DatasetVersion(BaseModel):
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
+    @property
+    def domain_name(self) -> str:
+        """Which domain generated this dataset, from its challenge ids (`fs-`, `sql-`, `ra-`). Kept in
+        one place: the API and CLI each had their own copy of this mapping, and evolving a dataset
+        trusted a caller-supplied domain instead — so evolving a research-agent dataset with the
+        default domain silently mixed ForgeSupport challenges into it."""
+        if not self.challenges:
+            raise ValueError(f"dataset '{self.dataset_id}' has no challenges")
+        prefix = self.challenges[0].challenge_id.split("-")[0]
+        return {"fs": "forge-support", "sql": "sql-agent", "ra": "research-agent"}.get(prefix, "forge-support")
+
     def split(self, name: str) -> list[Challenge]:
         return [c for c in self.challenges if c.split == name]
 

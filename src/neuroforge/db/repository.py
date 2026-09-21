@@ -180,12 +180,12 @@ def save_promotion_decision(
     # A repeat review of a genome whose canary already passed must not demote it from CANARY back to
     # APPROVED (the canary record still stands and `finalize` still honours it); a *rejection* is
     # fresh contrary evidence and does apply.
-    only_from = None
+    # Genomes that have been in production (PROMOTED, or SUPERSEDED — still restorable by a rollback)
+    # keep that status: a fresh review says nothing about their place in the production history.
+    protected = {PromotionStatus.PROMOTED.value, PromotionStatus.SUPERSEDED.value}
+    only_from = {s.value for s in PromotionStatus} - protected
     if decision.approved:
-        only_from = {s.value for s in PromotionStatus} - {
-            PromotionStatus.CANARY.value,
-            PromotionStatus.PROMOTED.value,
-        }
+        only_from -= {PromotionStatus.CANARY.value}
     _advance_status(session, genome_hash, decision.next_status.value, only_from=only_from)
     return record
 

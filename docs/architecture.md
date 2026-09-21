@@ -51,8 +51,11 @@ src/neuroforge/
   domains/       ApplicationDomain plugin interface + ForgeSupport/SQLAgent/ResearchAgent
   evaluation/    aggregation, Pareto frontier, statistical comparison, judge ensemble, objectives
   datasets/      DatasetVersion, holdout protection, benchmark evolution
-  promotion/     promotion gates, safety constraints, canary simulation
-  experiments/   ExperimentEngine (the orchestrator), budget, checkpoint/resume, events, queue
+  promotion/     gates, safety constraints (with confidence bounds), holdout verification, canary,
+                 plus the DB-backed review.py (promotion decisions) and lifecycle.py (champion,
+                 supersede, rollback) — not re-exported from the package, since they sit above db/
+  experiments/   ExperimentEngine (the orchestrator), budget, checkpoint/resume, events, queue,
+                 plus the DB-backed runner.py (run a stored experiment: API, CLI and worker share it)
   db/            SQLAlchemy models + repository functions (Postgres in prod, SQLite locally)
   cli/           Typer CLI — a thin wrapper over the same engine code the API uses
 
@@ -74,7 +77,7 @@ dashboard --HTTP--> api --enqueue--> Redis --BLPOP--> worker --writes--> Postgre
 
 The API also exposes a synchronous `/run` endpoint (used by the CLI and by CI) that executes the
 experiment in-request — appropriate for small demo budgets, not for production traffic. See
-docs/design-decisions.md ADR-0009.
+docs/design-decisions.md ADR-0010.
 
 ## Data flow inside one experiment
 

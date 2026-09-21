@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Annotated
 
 import typer
 from rich.console import Console
@@ -13,7 +14,7 @@ from rich.table import Table
 
 from neuroforge.cli.paths import state_dir
 from neuroforge.datasets.dataset import DatasetVersion
-from neuroforge.datasets.evolution import evolve_if_saturated, seed_dataset
+from neuroforge.datasets.evolution import evolve_from_failures, evolve_if_saturated, seed_dataset
 from neuroforge.db.repository import (
     genome_from_record,
     get_experiment,
@@ -42,9 +43,11 @@ from neuroforge.promotion.canary import fresh_traffic, simulate_canary
 from neuroforge.promotion.lifecycle import (
     ProductionError,
     current_champion,
+    production_lock,
     promote_to_production,
     resolve_baseline,
     rollback_production,
+    system_of_genome,
 )
 from neuroforge.promotion.review import ReviewError, review_promotion
 from neuroforge.providers.registry import get_provider
@@ -175,17 +178,31 @@ def dataset_list() -> None:
 @dataset_cmd.command("evolve")
 def dataset_evolve(
     dataset_id: str,
-    mean_score: float = typer.Option(..., help="mean search-split score observed for the current best candidates"),
-    domain: str = "forge-support",
+    mean_score: float | None = typer.Option(None, help="mean search-split score of the current best candidates (saturation-driven evolution)"),
+    failing_category: Annotated[
+        list[str] | None,
+        typer.Option(help="add challenges concentrated on this category (repeatable; failure-driven evolution)"),
+    ] = None,
+    domain: str | None = typer.Option(None, help="defaults to the dataset's own domain; if given it must match"),
     n_new: int = 30,
     seed: int = 2,
 ) -> None:
-    d = get_domain(domain)
     with session_scope() as session:
         current = latest_dataset_version(session, dataset_id)
         if current is None:
             raise typer.BadParameter(f"no dataset version found for '{dataset_id}' — run `dataset seed` first")
-        evolved = evolve_if_saturated(d, current, mean_score, n_new_challenges=n_new, seed=seed)
+        if domain is not None and domain != current.domain_name:
+            raise typer.BadParameter(f"dataset '{dataset_id}' belongs to domain '{current.domain_name}', not '{domain}'")
+        d = _domain_or_error(current.domain_name)
+        if failing_category:
+            try:
+                evolved = evolve_from_failures(d, current, failing_category, n_new, seed)
+            except ValueError as exc:
+                raise typer.BadParameter(str(exc)) from exc
+        elif mean_score is None:
+            raise typer.BadParameter("give --mean-score (saturation-driven) or --failing-category (failure-driven)")
+        else:
+            evolved = evolve_if_saturated(d, current, mean_score, n_new_challenges=n_new, seed=seed)
         if evolved is None:
             console.print(f"[yellow]not saturated[/] (mean_score={mean_score:.3f}) — benchmark unchanged")
             raise typer.Exit(0)
@@ -368,9 +385,7 @@ def candidate_compare(genome_a: str, genome_b: str, dataset_id: str, n_challenge
 
 
 def get_domain_for_dataset(dataset: DatasetVersion):
-    prefix = dataset.challenges[0].challenge_id.split("-")[0]
-    mapping = {"fs": "forge-support", "sql": "sql-agent", "ra": "research-agent"}
-    return get_domain(mapping.get(prefix, "forge-support"))
+    return get_domain(dataset.domain_name)
 
 
 # --- promotion ---------------------------------------------------------
@@ -400,12 +415,14 @@ def promotion_promote(genome_hash: str, experiment_id: str | None = None) -> Non
     Mirrors POST /api/v1/promotions/finalize, which requires an admin-role API key for the same
     reason: this is the one step meant to need an explicit, attributable human action."""
     approved_by = os.environ.get("USER", "cli")
-    with session_scope() as session:
-        try:
+    try:
+        with session_scope() as session:
+            system_id = system_of_genome(session, genome_hash)
+        with production_lock(system_id), session_scope() as session:
             outcome = promote_to_production(session, genome_hash, experiment_id, approved_by)
-        except ProductionError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-        superseded = outcome.superseded.hash if outcome.superseded else None
+            superseded = outcome.superseded.hash if outcome.superseded else None
+    except ProductionError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     console.print(f"status={PromotionStatus.PROMOTED.value} approved_by={approved_by}")
     if superseded:
         console.print(f"superseded previous champion {superseded} (restore it with `promotion rollback`)")
@@ -416,13 +433,13 @@ def promotion_rollback(system_id: str) -> None:
     """Take the application's current champion out of production and restore the one it replaced
     (or the original baseline, if it was the first). Mirrors POST /api/v1/promotions/rollback."""
     approved_by = os.environ.get("USER", "cli")
-    with session_scope() as session:
-        try:
+    try:
+        with production_lock(system_id), session_scope() as session:
             outcome = rollback_production(session, system_id, approved_by)
-        except ProductionError as exc:
-            raise typer.BadParameter(str(exc)) from exc
-        rolled_back = outcome.rolled_back.hash
-        restored = outcome.restored.hash if outcome.restored else None
+            rolled_back = outcome.rolled_back.hash
+            restored = outcome.restored.hash if outcome.restored else None
+    except ProductionError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     console.print(f"rolled back {rolled_back} (by {approved_by})")
     console.print(f"production is now {restored or 'the original baseline'}")
 
